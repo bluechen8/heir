@@ -55,3 +55,7 @@ build:asan --copt -fno-omit-frame-pointer
 build:asan --linkopt -fsanitize=address
 
 try-import %workspace%/fuzztest.bazelrc
+
+# Optional dev-box-specific overrides (e.g. --gcc-install-dir, linker
+# choice, disabled features). Not checked in.
+try-import %workspace%/user.bazelrc

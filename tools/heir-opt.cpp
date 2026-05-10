@@ -24,6 +24,7 @@
 #include "lib/Dialect/JaxiteWord/IR/JaxiteWordDialect.h"
 #include "lib/Dialect/KeyMgmt/IR/KeyMgmtDialect.h"
 #include "lib/Dialect/LWE/Conversions/LWEToLattigo/LWEToLattigo.h"
+#include "lib/Dialect/LWE/Conversions/LWEToLinalg/LWEToLinalg.h"
 #include "lib/Dialect/LWE/Conversions/LWEToOpenfhe/LWEToOpenfhe.h"
 #include "lib/Dialect/LWE/Conversions/LWEToPolynomial/LWEToPolynomial.h"
 #include "lib/Dialect/LWE/IR/LWEDialect.h"
@@ -68,6 +69,7 @@
 #include "lib/Target/SCIFRBool/SCIFRBoolEmitter.h"
 #include "lib/Transforms/ActivationCanonicalizations/ActivationCanonicalizations.h"
 #include "lib/Transforms/AddClientInterface/AddClientInterface.h"
+#include "lib/Transforms/SplitClientInterface/SplitClientInterface.h"
 #include "lib/Transforms/AnnotateModule/AnnotateModule.h"
 #include "lib/Transforms/AnnotateMulDepth/AnnotateMulDepth.h"
 #include "lib/Transforms/AnnotateSecretness/AnnotateSecretness.h"
@@ -305,6 +307,7 @@ int main(int argc, char** argv) {
   secret::registerSecretPasses();
   tensor_ext::registerTensorExtPasses();
   registerAddClientInterfacePass();
+  registerSplitClientInterfacePass();
   registerElementwiseToAffinePasses();
   registerSecretizePasses();
   registerSecretInsertMgmtPasses();
@@ -390,6 +393,7 @@ int main(int argc, char** argv) {
   // Dialect conversion passes in HEIR
   bgv::registerBGVToLWEPasses();
   lwe::registerLWEToLattigoPasses();
+  lwe::registerLWEToLinalgPasses();
   lwe::registerLWEToOpenfhePasses();
   lwe::registerLWEToPolynomialPasses();
   mlir::heir::arith::registerArithToCGGIPasses();

@@ -63,6 +63,14 @@ void moduleClearBackend(Operation* moduleOp);
 void moduleSetOpenfhe(Operation* moduleOp);
 void moduleSetLattigo(Operation* moduleOp);
 
+// Module attributes set by --split-client-interface to mark the two
+// nested modules it produces. Downstream passes (e.g. --lwe-to-linalg)
+// branch on these to pick which container to rewrite.
+constexpr const static ::llvm::StringLiteral kClientModuleAttrName =
+    "heir.client_module";
+constexpr const static ::llvm::StringLiteral kServerModuleAttrName =
+    "heir.server_module";
+
 // Func attributes for client helpers
 //
 // This corresponds to a named attribute client.enc_func whose
