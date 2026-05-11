@@ -118,8 +118,6 @@ linalg::GenericOp emitUnaryGeneric(OpBuilder& b, Location loc,
       });
 }
 
-// ─── TypeConverter ────────────────────────────────────────────────────────
-
 class CiphertextToTensorTypeConverter : public TypeConverter {
  public:
   CiphertextToTensorTypeConverter(MLIRContext* ctx) {
@@ -144,8 +142,6 @@ class CiphertextToTensorTypeConverter : public TypeConverter {
     }); // tensor-of-ciphertext → bigger tensor
   }
 };
-
-// ─── Patterns ─────────────────────────────────────────────────────────────
 
 struct ConvertRAdd : public OpConversionPattern<RAddOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -199,6 +195,99 @@ struct ConvertRSub : public OpConversionPattern<RSubOp> {
   }
 };
 
+// radd_plain / rsub_plain: result = (ct[0] ± pt, ct[1], ...). Only
+// the constant-term polynomial is touched. We extract ct[0,:,:], run
+// the same per-limb `emitElementwiseGeneric` helper as `radd`/`rsub`
+// but against the pre-encoded plaintext constant, and insert back.
+enum class CtPlainKind { Add, Sub };
+
+LogicalResult lowerCtPlain(Operation* op, Value origLhs, Value origRhs,
+                           Value adaptedLhs, CtPlainKind kind,
+                           ConversionPatternRewriter& rewriter) {
+  auto loc = op->getLoc();
+  auto ctType =
+      dyn_cast<LWECiphertextType>(getElementTypeOrSelf(origLhs.getType()));
+  if (!ctType)
+    return rewriter.notifyMatchFailure(op, "lhs is not a ciphertext");
+  auto layoutOr = inspectCiphertext(ctType);
+  if (failed(layoutOr))
+    return rewriter.notifyMatchFailure(op, "unsupported ciphertext type");
+  auto& layout = *layoutOr;
+
+  auto encodeOp = origRhs.getDefiningOp<RLWEEncodeOp>();
+  if (!encodeOp)
+    return rewriter.notifyMatchFailure(
+        op, "plaintext rhs does not come from lwe.rlwe_encode");
+  // `ElementsAttr` covers both inline DenseElementsAttr and
+  // resource-backed DenseResourceElementsAttr — `--fold-plaintext-encoding`
+  // picks the storage based on data size/sparsity.
+  auto limbsAttr = encodeOp->getAttrOfType<ElementsAttr>(kEncodedLimbsAttrName);
+  if (!limbsAttr)
+    return rewriter.notifyMatchFailure(
+        op, "encode op missing lwe.encoded_limbs attr; run "
+            "--fold-plaintext-encoding first");
+  auto ptTy = dyn_cast<RankedTensorType>(limbsAttr.getType());
+  if (!ptTy || !isa<IntegerType>(ptTy.getElementType()) ||
+      ptTy.getRank() != 2 || ptTy.getShape()[0] != layout.degree ||
+      ptTy.getShape()[1] != layout.numLimbs ||
+      cast<IntegerType>(ptTy.getElementType()) != layout.storageType)
+    return rewriter.notifyMatchFailure(
+        op, "lwe.encoded_limbs shape does not match ciphertext layout");
+
+  auto sliceTy = RankedTensorType::get({layout.degree, layout.numLimbs},
+                                       layout.storageType);
+  SmallVector<OpFoldResult> offsets(3, rewriter.getIndexAttr(0));
+  SmallVector<OpFoldResult> sizes = {rewriter.getIndexAttr(1),
+                                     rewriter.getIndexAttr(layout.degree),
+                                     rewriter.getIndexAttr(layout.numLimbs)};
+  SmallVector<OpFoldResult> strides(3, rewriter.getIndexAttr(1));
+  Value ct0 = tensor::ExtractSliceOp::create(rewriter, loc, sliceTy,
+                                             adaptedLhs, offsets, sizes,
+                                             strides);
+  Value ptInput = arith::ConstantOp::create(rewriter, loc, ptTy, limbsAttr);
+  Value moduli = materializeModuliConstant(rewriter, loc, layout);
+
+  auto generic = emitElementwiseGeneric(
+      rewriter, loc, sliceTy, ct0, ptInput, moduli,
+      [kind](OpBuilder& b, Location nloc, Value a, Value p,
+             Value m) -> Value {
+        if (kind == CtPlainKind::Add) {
+          Value s = arith::AddIOp::create(b, nloc, a, p);
+          return emitLazyModReduce(b, nloc, s, m);
+        }
+        // (a - p) mod q via add-q-then-lazy-reduce, mirrors ConvertRSub.
+        Value qMinusP = arith::SubIOp::create(b, nloc, m, p);
+        Value s = arith::AddIOp::create(b, nloc, a, qMinusP);
+        return emitLazyModReduce(b, nloc, s, m);
+      });
+  Value result = tensor::InsertSliceOp::create(rewriter, loc,
+                                               generic.getResult(0),
+                                               adaptedLhs, offsets, sizes,
+                                               strides);
+  rewriter.replaceOp(op, result);
+  return success();
+}
+
+struct ConvertRAddPlain : public OpConversionPattern<RAddPlainOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(
+      RAddPlainOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    return lowerCtPlain(op, op.getLhs(), op.getRhs(), adaptor.getLhs(),
+                        CtPlainKind::Add, rewriter);
+  }
+};
+
+struct ConvertRSubPlain : public OpConversionPattern<RSubPlainOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(
+      RSubPlainOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    return lowerCtPlain(op, op.getLhs(), op.getRhs(), adaptor.getLhs(),
+                        CtPlainKind::Sub, rewriter);
+  }
+};
+
 struct ConvertRNegate : public OpConversionPattern<RNegateOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -225,8 +314,6 @@ struct ConvertRNegate : public OpConversionPattern<RNegateOp> {
     return success();
   }
 };
-
-// ─── Pass driver ─────────────────────────────────────────────────────────
 
 // Identify which top-level container(s) `lwe-to-linalg` should rewrite.
 // Post-`--split-client-interface` modules nest a `heir.client_module`
@@ -258,13 +345,18 @@ struct LWEToLinalg : public impl::LWEToLinalgBase<LWEToLinalg> {
       target.addLegalDialect<arith::ArithDialect, linalg::LinalgDialect,
                              tensor::TensorDialect>();
       target.addLegalOp<ModuleOp>();
-      target.addIllegalOp<RAddOp, RSubOp, RNegateOp>();
+      target.addIllegalOp<RAddOp, RSubOp, RNegateOp, RAddPlainOp,
+                          RSubPlainOp>();
+      // `lwe.rlwe_encode` stays legal; it becomes dead after the
+      // ct-plain patterns consume its `lwe.encoded_limbs` attribute and
+      // is DCE'd downstream by `--canonicalize`.
 
       RewritePatternSet patterns(context);
-      patterns.add<ConvertRAdd, ConvertRSub, ConvertRNegate>(typeConverter,
-                                                             context);
+      patterns.add<ConvertRAdd, ConvertRSub, ConvertRNegate, ConvertRAddPlain,
+                   ConvertRSubPlain>(typeConverter, context);
       addStructuralConversionPatterns(typeConverter, patterns, target);
       addTensorOfTensorConversionPatterns(typeConverter, patterns, target);
+      addTensorConversionPatterns(typeConverter, patterns, target);
 
       ConversionConfig config;
       config.allowPatternRollback = false;

@@ -94,6 +94,22 @@ cc_library(
 )
 
 cc_library(
+    name = "LinalgPipelineRegistration",
+    srcs = ["LinalgPipelineRegistration.cpp"],
+    hdrs = ["LinalgPipelineRegistration.h"],
+    deps = [
+        ":ArithmeticPipelineRegistration",
+        "@heir//lib/Dialect/CKKS/Transforms:CKKSToLWE",
+        "@heir//lib/Dialect/LWE/Conversions/LWEToLinalg",
+        "@heir//lib/Transforms/FoldPlaintextEncoding",
+        "@heir//lib/Transforms/IsolateServerModule",
+        "@heir//lib/Transforms/SplitClientInterface",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Transforms",
+    ],
+)
+
+cc_library(
     name = "ArithmeticPipelineRegistration",
     srcs = ["ArithmeticPipelineRegistration.cpp"],
     hdrs = ["ArithmeticPipelineRegistration.h"],

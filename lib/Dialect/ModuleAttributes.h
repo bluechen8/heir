@@ -111,6 +111,13 @@ constexpr const static ::llvm::StringLiteral kClientHelperFuncName =
 // The argument or operand index the client helper function is for.
 constexpr const static ::llvm::StringLiteral kClientHelperIndex = "index";
 
+// Discardable attr stamped on `lwe.rlwe_encode` ops by
+// `--fold-plaintext-encoding` carrying the pre-encoded RNS limb tensor
+// (`tensor<degree x numLimbs x iK>`), consumed by `--lwe-to-linalg`'s
+// radd_plain/rsub_plain/rmul_plain patterns.
+constexpr const static ::llvm::StringLiteral kEncodedLimbsAttrName =
+    "lwe.encoded_limbs";
+
 }  // namespace heir
 }  // namespace mlir
 

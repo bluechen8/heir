@@ -65,11 +65,13 @@
 #include "lib/Dialect/TfheRustBool/IR/TfheRustBoolDialect.h"
 #include "lib/Pipelines/ArithmeticPipelineRegistration.h"
 #include "lib/Pipelines/BooleanPipelineRegistration.h"
+#include "lib/Pipelines/LinalgPipelineRegistration.h"
 #include "lib/Pipelines/PipelineRegistration.h"
 #include "lib/Target/SCIFRBool/SCIFRBoolEmitter.h"
 #include "lib/Transforms/ActivationCanonicalizations/ActivationCanonicalizations.h"
 #include "lib/Transforms/AddClientInterface/AddClientInterface.h"
 #include "lib/Transforms/SplitClientInterface/SplitClientInterface.h"
+#include "lib/Transforms/IsolateServerModule/IsolateServerModule.h"
 #include "lib/Transforms/AnnotateModule/AnnotateModule.h"
 #include "lib/Transforms/AnnotateMulDepth/AnnotateMulDepth.h"
 #include "lib/Transforms/AnnotateSecretness/AnnotateSecretness.h"
@@ -86,6 +88,7 @@
 #include "lib/Transforms/ElementwiseToAffine/ElementwiseToAffine.h"
 #include "lib/Transforms/EmitCInterface/EmitCInterface.h"
 #include "lib/Transforms/FoldConstantTensors/FoldConstantTensors.h"
+#include "lib/Transforms/FoldPlaintextEncoding/FoldPlaintextEncoding.h"
 #include "lib/Transforms/FoldPlaintextMasks/FoldPlaintextMasks.h"
 #include "lib/Transforms/ForwardInsertSliceToExtractSlice/ForwardInsertSliceToExtractSlice.h"
 #include "lib/Transforms/ForwardInsertToExtract/ForwardInsertToExtract.h"
@@ -308,6 +311,7 @@ int main(int argc, char** argv) {
   tensor_ext::registerTensorExtPasses();
   registerAddClientInterfacePass();
   registerSplitClientInterfacePass();
+  registerIsolateServerModulePass();
   registerElementwiseToAffinePasses();
   registerSecretizePasses();
   registerSecretInsertMgmtPasses();
@@ -327,6 +331,7 @@ int main(int argc, char** argv) {
   registerAnnotateMulDepthPasses();
   registerApplyFoldersPasses();
   registerBooleanVectorizerPasses();
+  registerFoldPlaintextEncodingPasses();
   registerFoldPlaintextMasksPasses();
   registerForwardInsertSliceToExtractSlicePasses();
   registerForwardInsertToExtractPasses();
@@ -485,6 +490,21 @@ int main(int argc, char** argv) {
       "Convert a func using standard MLIR dialects to FHE using "
       "CKKS.",
       mlirToRLWEPipelineBuilder(mlir::heir::RLWEScheme::ckksScheme));
+
+  PassPipelineRegistration<mlir::heir::MlirToRLWEPipelineOptions>(
+      "mlir-to-ciphertext-linalg",
+      "Convert a func using standard MLIR dialects to portable linalg + "
+      "tensor + arith IR consumable by iree-compile (server-only; A1).",
+      [](OpPassManager& pm,
+         const mlir::heir::MlirToRLWEPipelineOptions& options) {
+        mlir::heir::toIreeLinalgPipelineBuilder(pm, options);
+      });
+
+  PassPipelineRegistration<>(
+      "lwe-to-iree-linalg",
+      "Lower an already-server-only LWE module to portable linalg + tensor "
+      "+ arith IR (the tail of --mlir-to-ciphertext-linalg).",
+      mlir::heir::lweToLinalgPipelineBuilder);
 
   PassPipelineRegistration<mlir::heir::BackendOptions>(
       "scheme-to-openfhe",
