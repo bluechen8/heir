@@ -1,0 +1,21 @@
+# Dev-box-specific build settings for cipherplan-heir.
+# Picked up via `try-import %workspace%/user.bazelrc` in .bazelrc.
+
+# Disable HEIR features not on the linalg/IREE path.
+build --//:enable_yosys=0
+build --//:enable_openmp=0
+build --@openfhe//:enable_openmp=False
+
+# Pin clang to GCC 13's libstdc++ — dev box has /usr/include/c++/13
+# but no /usr/include/c++/14, which clang would pick up by default.
+build --cxxopt=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13
+build --copt=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13
+build --host_cxxopt=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13
+build --host_copt=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13
+build --linkopt=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13
+build --host_linkopt=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13
+
+# Override the .bazelrc default of -fuse-ld=lld (lld unavailable on
+# this box). Last --linkopt wins for clang's -fuse-ld.
+build --linkopt=-fuse-ld=gold
+build --host_linkopt=-fuse-ld=gold
