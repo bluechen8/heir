@@ -50,5 +50,11 @@ tests/Examples/tfhe_rust_bool/fpga/tfhe-rs/
 # for python files
 __pycache__/
 
+# AI agent config
+.codex
+
 # lockfile is updated by automation
 MODULE.bazel.lock
+
+scripts/torch_ci/failure_logs
+scripts/torch_ci/models/*.mlir

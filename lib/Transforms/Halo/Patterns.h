@@ -59,7 +59,8 @@ struct BootstrapIterArgsPattern : public OpRewritePattern<T> {
     secretInitIndices.reserve(forOp.getInits().size());
 
     for (auto [i, init] : llvm::enumerate(forOp.getInits())) {
-      if (isSecret(init, solver)) {
+      bool secret = isSecret(init, solver);
+      if (secret) {
         secretInitIndices.push_back(i);
       }
     }
@@ -168,6 +169,12 @@ struct DeleteAnnotatedOps : public RewritePattern {
   LogicalResult matchAndRewrite(Operation* op,
                                 PatternRewriter& rewriter) const override;
 };
+
+LogicalResult doPartialUnroll(affine::AffineForOp forOp,
+                              PatternRewriter& rewriter, int forceMaxLevel,
+                              DataFlowSolver* solver);
+LogicalResult doPartialUnroll(scf::ForOp forOp, PatternRewriter& rewriter,
+                              int forceMaxLevel, DataFlowSolver* solver);
 
 }  // namespace heir
 }  // namespace mlir

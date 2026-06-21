@@ -21,22 +21,59 @@ func.func @test_lower_encapsulate_vec(%lhs : tensor<4xi32>) -> !Zpv {
   return %res : !Zpv
 }
 
-// CHECK: @test_lower_extract
-// CHECK-SAME: (%[[LHS:.*]]: [[T:.*]]) -> [[T]] {
-func.func @test_lower_extract(%lhs : !Zp) -> i32 {
-  // CHECK-NOT: mod_arith.extract
-  // CHECK: return %[[LHS]] : [[T]]
-  %res = mod_arith.extract %lhs: !Zp -> i32
-  return %res : i32
+// CHECK: @standard
+// CHECK-SAME: (%[[arg0:.*]]: [[T:.*]]) -> [[T]] {
+func.func @standard(%arg0: !Zp) -> i32 {
+  // CHECK: %[[q:.*]] = arith.constant 65537 : i32
+  // CHECK: %[[rems:.*]] = arith.remsi %[[arg0]], %[[q]] : i32
+  // CHECK: %[[c0:.*]] = arith.constant 0 : i32
+  // CHECK: %[[isneg:.*]] = arith.cmpi slt, %[[rems]], %[[c0]] : i32
+  // CHECK: %[[remsPos:.*]] = arith.addi %[[rems]], %[[q]] : i32
+  // CHECK: %[[stdResult:.*]] = arith.select %[[isneg]], %[[remsPos]], %[[rems]] : i32
+  // CHECK: return %[[stdResult]] : i32
+  %0 = mod_arith.lift standard %arg0 : !Zp -> i32
+  return %0 : i32
 }
 
-// CHECK: @test_lower_extract_vec
-// CHECK-SAME: (%[[LHS:.*]]: [[T:.*]]) -> [[T]] {
-func.func @test_lower_extract_vec(%lhs : !Zpv) -> tensor<4xi32> {
-  // CHECK-NOT: mod_arith.extract
-  // CHECK: return %[[LHS]] : [[T]]
-  %res = mod_arith.extract %lhs: !Zpv -> tensor<4xi32>
-  return %res : tensor<4xi32>
+// CHECK: @centered
+// CHECK-SAME: (%[[arg0:.*]]: [[T:.*]]) -> [[T]] {
+func.func @centered(%arg0: !Zp) -> i32 {
+  // CHECK: %[[q:.*]] = arith.constant 65537 : i32
+  // CHECK: %[[rems:.*]] = arith.remsi %[[arg0]], %[[q]] : i32
+  // CHECK: %[[c0:.*]] = arith.constant 0 : i32
+  // CHECK: %[[isneg:.*]] = arith.cmpi slt, %[[rems]], %[[c0]] : i32
+  // CHECK: %[[remsPos:.*]] = arith.addi %[[rems]], %[[q]] : i32
+  // CHECK: %[[stdResult:.*]] = arith.select %[[isneg]], %[[remsPos]], %[[rems]] : i32
+  // CHECK: %[[c1:.*]] = arith.constant 1 : i32
+  // CHECK: %[[c2:.*]] = arith.constant 2 : i32
+  // CHECK: %[[qp1:.*]] = arith.addi %[[q]], %[[c1]] : i32
+  // CHECK: %[[bound:.*]] = arith.divsi %[[qp1]], %[[c2]] : i32
+  // CHECK: %[[tooBig:.*]] = arith.cmpi sge, %[[stdResult]], %[[bound]] : i32
+  // CHECK: %[[lb:.*]] = arith.subi %[[stdResult]], %[[q]] : i32
+  // CHECK: %[[cResult:.*]] = arith.select %[[tooBig]], %[[lb]], %[[stdResult]] : i32
+  // CHECK: return %[[cResult]] : i32
+  %0 = mod_arith.lift centered %arg0 : !Zp -> i32
+  return %0 : i32
+}
+
+// CHECK: @centered_tensor
+func.func @centered_tensor(%arg0: !Zpv) -> tensor<4xi32> {
+  // CHECK: arith.constant dense<65537> : tensor<4xi32>
+  // CHECK: arith.remsi
+  // CHECK: arith.constant dense<0> : tensor<4xi32>
+  // CHECK: arith.cmpi
+  // CHECK: arith.addi
+  // CHECK: arith.select
+  // CHECK: arith.constant dense<1> : tensor<4xi32>
+  // CHECK: arith.constant dense<2> : tensor<4xi32>
+  // CHECK: arith.addi
+  // CHECK: arith.divsi
+  // CHECK: arith.cmpi
+  // CHECK: arith.subi
+  // CHECK: arith.select
+  // CHECK: return
+  %0 = mod_arith.lift centered %arg0 : !Zpv -> tensor<4xi32>
+  return %0 : tensor<4xi32>
 }
 
 // CHECK: @test_lower_reduce
@@ -257,6 +294,25 @@ func.func @test_lower_barrett_reduce_int(%arg : i10) -> i10 {
 !Zp_same_width = !mod_arith.int<33181787 : i26>
 !Zp_smaller_width = !mod_arith.int<257 : i10>
 !RNS = !rns.rns<!mod_arith.int<829 : i11>, !mod_arith.int<101 : i11>, !mod_arith.int<37 : i11>>
+!RNS_slice = !rns.rns<!mod_arith.int<101 : i11>, !mod_arith.int<37 : i11>>
+
+// CHECK: @test_lower_rns_extract_slice
+// CHECK-SAME: (%[[ARG:.*]]: tensor<3xi11>) -> tensor<2xi11>
+func.func @test_lower_rns_extract_slice(%arg : !RNS) -> !RNS_slice {
+  // CHECK: %[[SLICE:.*]] = tensor.extract_slice %[[ARG]][1] [2] [1] : tensor<3xi11> to tensor<2xi11>
+  %res = rns.extract_slice %arg {start = 1 : index, size = 2 : index} : !RNS -> !RNS_slice
+  // CHECK: return %[[SLICE]]
+  return %res : !RNS_slice
+}
+
+// CHECK: @test_lower_tensor_rns_extract_slice
+// CHECK-SAME: (%[[ARG:.*]]: tensor<4x3xi11>) -> tensor<4x2xi11>
+func.func @test_lower_tensor_rns_extract_slice(%arg : tensor<4x!RNS>) -> tensor<4x!RNS_slice> {
+  // CHECK: %[[SLICE:.*]] = tensor.extract_slice %[[ARG]][0, 1] [4, 2] [1, 1] : tensor<4x3xi11> to tensor<4x2xi11>
+  %res = rns.extract_slice %arg {start = 1 : index, size = 2 : index} : tensor<4x!RNS> -> tensor<4x!RNS_slice>
+  // CHECK: return %[[SLICE]]
+  return %res : tensor<4x!RNS_slice>
+}
 
 // CHECK: @test_lower_mod_switch_decompose
 // CHECK-SAME: (%[[ARG:.*]]: [[INT_TYPE:.*]]) -> [[TENSOR_TYPE:.*]] {

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "lib/Dialect/Debug/IR/DebugOps.h"
 #include "lib/Dialect/LWE/IR/LWEAttributes.h"
 #include "lib/Dialect/LWE/IR/LWEDialect.h"
 #include "lib/Dialect/LWE/IR/LWEOps.h"
@@ -22,10 +23,10 @@
 #include "mlir/include/mlir/Dialect/Affine/IR/AffineOps.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
+#include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
 #include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Utils/StaticValueUtils.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/Attributes.h"          // from @llvm-project
-#include "mlir/include/mlir/IR/BuiltinOps.h"          // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinTypes.h"        // from @llvm-project
 #include "mlir/include/mlir/IR/OpDefinition.h"        // from @llvm-project
 #include "mlir/include/mlir/IR/PatternMatch.h"        // from @llvm-project
@@ -516,33 +517,34 @@ void addSecretToSchemeDefaultConversionTargetsAndPatterns(
     ContextAwareTypeConverter& typeConverter) {
   target.addLegalDialect<lwe::LWEDialect, arith::ArithDialect,
                          tensor::TensorDialect>();
-  target.addLegalOp<ModuleOp>();
-
   target.addIllegalDialect<secret::SecretDialect>();
-  target.addIllegalOp<mgmt::ModReduceOp, mgmt::RelinearizeOp,
-                      secret::GenericOp>();
+  target.addIllegalOp<mgmt::ModReduceOp, mgmt::RelinearizeOp>();
 
-  target.addDynamicallyLegalOp<affine::AffineForOp, affine::AffineYieldOp>(
-      [&](Operation* op) { return typeConverter.isLegal(op); });
-  target.addDynamicallyLegalOp<func::CallOp>(
+  target.addDynamicallyLegalOp<affine::AffineForOp, affine::AffineYieldOp,
+                               affine::AffineIfOp, scf::ForOp, scf::IfOp,
+                               scf::YieldOp, func::CallOp>(
       [&](Operation* op) { return typeConverter.isLegal(op); });
   target.markUnknownOpDynamicallyLegal(
       [&](Operation* op) { return !hasSecretOperandsOrResults(op); });
 
-  patterns.add<SecretGenericOpIdentityConversion<arith::ExtUIOp>,
-               SecretGenericOpIdentityConversion<arith::ExtSIOp>,
-               SecretGenericOpIdentityConversion<arith::FPToSIOp>,
-               SecretGenericOpIdentityConversion<arith::FPToUIOp>,
-               SecretGenericOpIdentityConversion<arith::SIToFPOp>,
-               SecretGenericOpIdentityConversion<arith::UIToFPOp>,
-               SecretGenericOpConversion<tensor::EmptyOp, tensor::EmptyOp>,
-               SecretGenericFuncCallConversion, ConvertExtractSlice,
-               ConvertInsertSlice, ConvertAnyContextAware<affine::AffineForOp>,
-               ConvertAnyContextAware<affine::AffineYieldOp>,
-               ConvertAnyContextAware<tensor::ExtractOp>,
-               ConvertAnyContextAware<tensor::InsertOp>,
-               ConvertAnyContextAware<func::CallOp>>(typeConverter,
-                                                     patterns.getContext());
+  patterns.add<
+      ConvertAnyContextAware<affine::AffineForOp>,
+      ConvertAnyContextAware<affine::AffineIfOp>,
+      ConvertAnyContextAware<affine::AffineYieldOp>,
+      ConvertAnyContextAware<func::CallOp>, ConvertAnyContextAware<scf::ForOp>,
+      ConvertAnyContextAware<scf::IfOp>, ConvertAnyContextAware<scf::YieldOp>,
+      ConvertAnyContextAware<tensor::ExtractOp>,
+      ConvertAnyContextAware<tensor::InsertOp>,
+      SecretGenericOpConversion<debug::ValidateOp>, ConvertExtractSlice,
+      ConvertInsertSlice, SecretGenericFuncCallConversion,
+      SecretGenericOpConversion<tensor::EmptyOp, tensor::EmptyOp>,
+      SecretGenericOpIdentityConversion<arith::ExtSIOp>,
+      SecretGenericOpIdentityConversion<arith::ExtUIOp>,
+      SecretGenericOpIdentityConversion<arith::FPToSIOp>,
+      SecretGenericOpIdentityConversion<arith::FPToUIOp>,
+      SecretGenericOpIdentityConversion<arith::SIToFPOp>,
+      SecretGenericOpIdentityConversion<arith::UIToFPOp>>(
+      typeConverter, patterns.getContext());
 
   addStructuralConversionPatterns(typeConverter, patterns, target);
 }

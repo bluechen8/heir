@@ -1,4 +1,4 @@
-load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library")
+load("@heir//lib/Transforms:transforms.bzl", "add_heir_transforms")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 package(
@@ -11,7 +11,6 @@ cc_library(
     hdrs = ["Passes.h"],
     deps = [
         ":CKKSToLWE",
-        ":DecomposeKeySwitch",
         ":DecomposeRelinearize",
         ":pass_inc_gen",
         "@heir//lib/Dialect/CKKS/IR:Dialect",
@@ -52,39 +51,8 @@ cc_library(
     ],
 )
 
-cc_library(
-    name = "DecomposeKeySwitch",
-    srcs = ["DecomposeKeySwitch.cpp"],
-    hdrs = ["DecomposeKeySwitch.h"],
-    deps = [
-        ":pass_inc_gen",
-        "@heir//lib/Dialect/CKKS/IR:Dialect",
-        "@heir//lib/Dialect/LWE/IR:Dialect",
-        "@heir//lib/Dialect/ModArith/IR:Dialect",
-        "@heir//lib/Dialect/RNS/IR:Dialect",
-        "@heir//lib/Parameters/CKKS:Params",
-        "@llvm-project//mlir:ArithDialect",
-        "@llvm-project//mlir:IR",
-        "@llvm-project//mlir:Pass",
-        "@llvm-project//mlir:Support",
-        "@llvm-project//mlir:TensorDialect",
-        "@llvm-project//mlir:TransformUtils",
-    ],
-)
-
-gentbl_cc_library(
-    name = "pass_inc_gen",
-    tbl_outs = {
-        "Passes.h.inc": [
-            "-gen-pass-decls",
-            "-name=CKKS",
-        ],
-        "CKKSPasses.md": ["-gen-pass-doc"],
-    },
-    tblgen = "@llvm-project//mlir:mlir-tblgen",
+add_heir_transforms(
+    header_filename = "Passes.h.inc",
+    pass_name = "CKKS",
     td_file = "Passes.td",
-    deps = [
-        "@llvm-project//mlir:OpBaseTdFiles",
-        "@llvm-project//mlir:PassBaseTdFiles",
-    ],
 )

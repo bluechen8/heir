@@ -64,7 +64,8 @@ class MLIRLoopNestGenerator {
   // Assumes that the tree is a perfect loop nest.
   FailureOr<scf::ForOp> generateForLoop(
       const presburger::IntegerRelation& rel, ValueRange initArgs,
-      BodyBuilderFn bodyBuilder, ArrayRef<int> domainIndicesToSchedule = {});
+      BodyBuilderFn bodyBuilder, ArrayRef<int> domainIndicesToSchedule = {},
+      bool reverse = false);
 
  private:
   FailureOr<scf::ValueVector> visitAstNode(isl_ast_node* node,
@@ -73,6 +74,8 @@ class MLIRLoopNestGenerator {
                                               BodyBuilderFn bodyBuilder);
   FailureOr<scf::ValueVector> visitAstNodeIf(isl_ast_node* node,
                                              BodyBuilderFn bodyBuilder);
+  FailureOr<scf::ValueVector> visitAstNodeBlock(isl_ast_node* node,
+                                                BodyBuilderFn bodyBuilder);
   FailureOr<scf::ValueVector> visitAstNodeUser(isl_ast_node* node,
                                                BodyBuilderFn bodyBuilder);
 
@@ -87,6 +90,7 @@ class MLIRLoopNestGenerator {
   SmallVector<scf::ForOp> loops_;
 
   const std::function<void(Operation*)> createdOpCallback_;
+  bool reverse_ = false;
 };
 
 }  // namespace heir

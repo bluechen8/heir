@@ -30,16 +30,22 @@ cc_library(
         ":ops_inc_gen",
         ":type_interfaces_inc_gen",
         ":types_inc_gen",
-        "@heir//lib/Dialect/ModArith/IR:ModArithTypeInterfaces",
+        "@heir//lib/Dialect:HEIRInterfaces",
+        "@heir//lib/Dialect/ModArith/IR:Dialect",
+        "@heir//lib/Dialect/ModArith/IR:TypeInterfaces",
+        "@heir//lib/Utils:APIntUtils",
         "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:InferTypeOpInterface",
+        "@llvm-project//mlir:SCFDialect",
         "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
     ],
 )
 
 cc_library(
-    name = "RNSTypeInterfaces",
+    name = "TypeInterfaces",
     hdrs = [
         "RNSDialect.h",
         "RNSTypeInterfaces.h",
@@ -63,6 +69,7 @@ td_library(
     includes = ["../../../.."],
     deps = [
         ":type_interfaces_td",
+        "@heir//lib/Dialect:td_files",
         "@heir//lib/Dialect/ModArith/IR:type_interfaces_td",
         "@llvm-project//mlir:BuiltinDialectTdFiles",
         "@llvm-project//mlir:InferTypeOpInterfaceTdFiles",

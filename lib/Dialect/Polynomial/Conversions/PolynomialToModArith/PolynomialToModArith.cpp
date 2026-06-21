@@ -19,6 +19,7 @@
 #include "lib/Dialect/Polynomial/IR/PolynomialOps.h"
 #include "lib/Dialect/Polynomial/IR/PolynomialTypes.h"
 #include "lib/Dialect/RNS/IR/RNSAttributes.h"
+#include "lib/Dialect/RNS/IR/RNSOps.h"
 #include "lib/Dialect/RNS/IR/RNSTypes.h"
 #include "lib/Utils/APIntUtils.h"
 #include "lib/Utils/ConversionUtils.h"
@@ -259,6 +260,28 @@ struct ConvertToTensor : public OpConversionPattern<ToTensorOp> {
   }
 };
 
+struct ConvertPolynomialExtractSlice
+    : public OpConversionPattern<ExtractSliceOp> {
+  ConvertPolynomialExtractSlice(mlir::MLIRContext* context)
+      : OpConversionPattern<ExtractSliceOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      ExtractSliceOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto resultType = getTypeConverter()->convertType(op.getOutput().getType());
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(op, "result type conversion failed");
+    }
+
+    rewriter.replaceOpWithNewOp<rns::ExtractSliceOp>(
+        op, resultType, adaptor.getInput(), op.getStartAttr(),
+        op.getSizeAttr());
+    return success();
+  }
+};
+
 struct ConvertConstant : public OpConversionPattern<ConstantOp> {
   ConvertConstant(mlir::MLIRContext* context)
       : OpConversionPattern<ConstantOp>(context) {}
@@ -275,6 +298,11 @@ struct ConvertConstant : public OpConversionPattern<ConstantOp> {
           op, "failed to construct common conversion info");
 
     auto typeInfo = res.value();
+    // TODO(#97): support compile-time NTT
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "unsupported eval-form polynomial constant");
+    }
 
     auto attr = dyn_cast<TypedIntPolynomialAttr>(op.getValue());
     if (!attr)
@@ -370,6 +398,25 @@ struct ConvertMonomial : public OpConversionPattern<MonomialOp> {
     auto storageTensorType =
         RankedTensorType::get(storageShape, typeInfo.coefficientStorageType);
 
+    // TODO(#97): support compile-time NTT
+    // We don't have proper support for EVAL-form constants, but we can
+    // at least support degree-zero polynomial constants in EVAL form. The
+    // NTT of a degree-zero polynomial is a vector where each coefficient is the
+    // constant term.
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      IntegerAttr degreeAttr;
+      if (!matchPattern(adaptor.getDegree(), m_Constant(&degreeAttr)) ||
+          degreeAttr.getInt() != 0) {
+        return rewriter.notifyMatchFailure(
+            op, "unsupported eval-form non-constant monomial");
+      }
+
+      Value result = tensor::SplatOp::create(b, adaptor.getCoefficient(),
+                                             typeInfo.tensorType);
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
     auto tensor = arith::ConstantOp::create(
         b, DenseElementsAttr::get(
                storageTensorType,
@@ -414,6 +461,15 @@ struct ConvertMulScalar : public OpConversionPattern<MulScalarOp> {
 
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
 
+    if (isa<RNSType>(typeInfo.coefficientType)) {
+      Value replicatedScalar =
+          tensor::SplatOp::create(b, adaptor.getScalar(), typeInfo.tensorType);
+      auto mulOp = mod_arith::MulOp::create(b, adaptor.getPolynomial(),
+                                            replicatedScalar);
+      rewriter.replaceOp(op, mulOp);
+      return success();
+    }
+
     // We need to repeat the `scalar` operand to match the tensor shape of the
     // `polynomial` operand, and then it can be lowered to a simple
     // mod_arith.mul.
@@ -431,8 +487,9 @@ struct ConvertMulScalar : public OpConversionPattern<MulScalarOp> {
           op, "expected coefficient type to implement ModQTypeInterface");
     }
 
-    auto extracted =
-        mod_arith::ExtractOp::create(b, extractedType, adaptor.getScalar());
+    // either representative suffices since we are re-encapsulating
+    auto extracted = mod_arith::LiftOp::create(
+        b, extractedType, adaptor.getScalar(), mod_arith::LiftType::STANDARD);
 
     Value replicatedScalar;
     if (isa<ShapedType>(extractedType)) {
@@ -513,6 +570,10 @@ struct ConvertMonicMonomialMul
       return rewriter.notifyMatchFailure(
           op, "failed to construct common conversion info");
     auto typeInfo = res.value();
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "MonicMonomialMul requires COEFF form input");
+    }
 
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
     // In general, a rotation would correspond to multiplication by x^n,
@@ -599,6 +660,10 @@ struct ConvertLeadingTerm : public OpConversionPattern<LeadingTermOp> {
       return rewriter.notifyMatchFailure(
           op, "failed to construct common conversion info");
     auto typeInfo = res.value();
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "LeadingTerm requires COEFF form input");
+    }
 
     auto c0 = arith::ConstantOp::create(
         b, b.getIntegerAttr(typeInfo.coefficientStorageType, 0));
@@ -616,9 +681,10 @@ struct ConvertLeadingTerm : public OpConversionPattern<LeadingTermOp> {
           Value index = args[0];
           ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
           auto coeff = tensor::ExtractOp::create(b, coeffs, ValueRange{index});
-          auto normalizedCoeff = mod_arith::ReduceOp::create(b, coeff);
-          auto extractedCoeff = mod_arith::ExtractOp::create(
-              b, typeInfo.coefficientStorageType, normalizedCoeff);
+          // either representative suffices since both lift 0 to 0
+          auto extractedCoeff =
+              mod_arith::LiftOp::create(b, typeInfo.coefficientStorageType,
+                                        coeff, mod_arith::LiftType::STANDARD);
           auto cmpOp = arith::CmpIOp::create(b, arith::CmpIPredicate::eq,
                                              extractedCoeff, c0);
           scf::ConditionOp::create(b, cmpOp.getResult(), index);
@@ -654,6 +720,10 @@ struct ConvertApplyCoefficientwise
       return rewriter.notifyMatchFailure(
           op, "failed to construct common conversion info");
     auto typeInfo = res.value();
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op, "ApplyCoefficientwise requires COEFF form input");
+    }
 
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
     Value inputTensor = adaptor.getInput();
@@ -1596,13 +1666,14 @@ void PolynomialToModArith::runOnOperation() {
   target.addIllegalDialect<PolynomialDialect>();
   RewritePatternSet patterns(context);
 
-  patterns.add<ConvertFromTensor, ConvertToTensor,
-               ConvertPolyBinop<AddOp, arith::AddIOp, mod_arith::AddOp>,
-               ConvertPolyBinop<SubOp, arith::SubIOp, mod_arith::SubOp>,
-               ConvertLeadingTerm, ConvertMonomial, ConvertMonicMonomialMul,
-               ConvertConstant, ConvertMulScalar, ConvertNTT, ConvertINTT,
-               ConvertApplyCoefficientwise, ConvertMulEvalForm>(typeConverter,
-                                                                context);
+  patterns
+      .add<ConvertFromTensor, ConvertToTensor, ConvertPolynomialExtractSlice,
+           ConvertPolyBinop<AddOp, arith::AddIOp, mod_arith::AddOp>,
+           ConvertPolyBinop<SubOp, arith::SubIOp, mod_arith::SubOp>,
+           ConvertLeadingTerm, ConvertMonomial, ConvertMonicMonomialMul,
+           ConvertConstant, ConvertMulScalar, ConvertNTT, ConvertINTT,
+           ConvertApplyCoefficientwise, ConvertMulEvalForm>(typeConverter,
+                                                            context);
   patterns.add<ConvertMulCoeffForm>(typeConverter, patterns.getContext(),
                                     getDivmodOp);
   addStructuralConversionPatterns(typeConverter, patterns, target);
@@ -1610,7 +1681,6 @@ void PolynomialToModArith::runOnOperation() {
 
   ConversionConfig config;
   config.allowPatternRollback = false;
-  config.buildMaterializations = buildMaterializations;
   if (failed(applyPartialConversion(module, target, std::move(patterns),
                                     config))) {
     signalPassFailure();

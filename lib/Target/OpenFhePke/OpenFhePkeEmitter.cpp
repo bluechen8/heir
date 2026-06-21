@@ -32,7 +32,8 @@
 #include "llvm/include/llvm/Support/LogicalResult.h"   // from @llvm-project
 #include "llvm/include/llvm/Support/raw_ostream.h"     // from @llvm-project
 #include "mlir/include/mlir/Dialect/Affine/IR/AffineOps.h"  // from @llvm-project
-#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
 #include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
 #include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
@@ -243,12 +244,15 @@ LogicalResult OpenFhePkeEmitter::translate(Operation& op) {
           .Case<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                 arith::FloorDivSIOp, arith::IndexCastOp, arith::ExtFOp,
                 arith::RemSIOp, arith::AddIOp, arith::AddFOp, arith::AndIOp,
-                arith::SubIOp, arith::MulFOp, arith::MulIOp, arith::DivSIOp,
-                arith::CmpIOp, arith::SelectOp, arith::MaxSIOp, arith::MinSIOp>(
-              [&](auto op) { return printOperation(op); })
+                arith::OrIOp, arith::XOrIOp, arith::SubIOp, arith::SubFOp,
+                arith::MulFOp, arith::MulIOp, arith::DivSIOp, arith::DivFOp,
+                arith::CmpIOp, arith::CmpFOp, arith::SelectOp, arith::MaxSIOp,
+                arith::MinSIOp>([&](auto op) { return printOperation(op); })
           // SCF ops
           .Case<scf::IfOp, scf::ForOp, scf::ForallOp, scf::InParallelOp,
                 scf::YieldOp>([&](auto op) { return printOperation(op); })
+          // ControlFlow ops
+          .Case<cf::AssertOp>([&](auto op) { return printOperation(op); })
           // Tensor ops
           .Case<tensor::ConcatOp, tensor::EmptyOp, tensor::InsertOp,
                 tensor::InsertSliceOp, tensor::ExtractOp,
@@ -385,7 +389,20 @@ LogicalResult OpenFhePkeEmitter::printOperation(func::CallOp op) {
          << definingOp->getName() << "\";\n";
     }
     // Use AsmPrinter to print Value
-    os << debugAttrMapName << R"(["asm.result_ssa_format"] = ")" << ciphertext
+    std::string ssaFormat;
+    llvm::raw_string_ostream ss(ssaFormat);
+    ss << ciphertext;
+    std::string escaped;
+    for (char c : ssaFormat) {
+      if (c == '\n') {
+        escaped += "\\n";
+      } else if (c == '"') {
+        escaped += "\\\"";
+      } else {
+        escaped += c;
+      }
+    }
+    os << debugAttrMapName << R"(["asm.result_ssa_format"] = ")" << escaped
        << "\";\n";
   }
 
@@ -516,6 +533,13 @@ LogicalResult OpenFhePkeEmitter::printOperation(affine::AffineYieldOp op) {
   return success();
 }
 
+LogicalResult OpenFhePkeEmitter::printOperation(cf::AssertOp op) {
+  os << "assert(" << variableNames->getNameForValue(op.getArg()) << " && \""
+     << op.getMsg() << "\");\n";
+  os << "(void)" << variableNames->getNameForValue(op.getArg()) << ";\n";
+  return success();
+}
+
 LogicalResult OpenFhePkeEmitter::printOperation(scf::IfOp op) {
   // ResultType result;
   // if (value) {
@@ -609,10 +633,11 @@ LogicalResult OpenFhePkeEmitter::printOperation(scf::ForOp op) {
     os << ";\n";
   }
 
-  os << llvm::formatv("for (auto {0} = {1}; {0} < {2}; ++{0}) {{\n",
+  os << llvm::formatv("for (auto {0} = {1}; {0} < {2}; {0} += {3}) {{\n",
                       variableNames->getNameForValue(op.getInductionVar()),
                       getConstantOrValue(op.getLowerBound()),
-                      getConstantOrValue(op.getUpperBound()));
+                      getConstantOrValue(op.getUpperBound()),
+                      getConstantOrValue(op.getStep()));
   os.indent();
   for (Operation& op : *op.getBody()) {
     if (failed(translate(op))) {
@@ -626,18 +651,29 @@ LogicalResult OpenFhePkeEmitter::printOperation(scf::ForOp op) {
 }
 
 LogicalResult OpenFhePkeEmitter::printOperation(scf::ForallOp op) {
-  // Use OMP for parallelization
-  // #pragma omp parallel for
-  os << "#pragma omp parallel for\n";
-
   for (auto result : op.getResults()) {
     OpOperand* opOperand = op.getTiedOpOperand(result);
     BlockArgument blockArg = op.getTiedBlockArgument(opOperand);
 
-    // Map the block argument and the result to the opOperand name.
-    variableNames->mapValueNameToValue(blockArg, opOperand->get());
-    variableNames->mapValueNameToValue(result, opOperand->get());
+    Value init = opOperand->get();
+    if (init.hasOneUse()) {
+      // The loop is the sole user of the init buffer, so the result can
+      // share its storage.
+      variableNames->mapValueNameToValue(blockArg, init);
+      variableNames->mapValueNameToValue(result, init);
+    } else {
+      // The init buffer is shared with other ops (e.g., another forall loop
+      // seeded from the same init tensor), so writing into it would clobber
+      // a value that is still live. Materialize the result as a copy.
+      os << "auto " << variableNames->getNameForValue(result) << " = "
+         << variableNames->getNameForValue(init) << ";\n";
+      variableNames->mapValueNameToValue(blockArg, result);
+    }
   }
+
+  // Use OMP for parallelization
+  // #pragma omp parallel for
+  os << "#pragma omp parallel for\n";
 
   // Later, support for multi-dimensional forall loops. It's pretty unlikely
   // there would be a multi-dimensional use case (for iterating over multiple
@@ -1233,6 +1269,14 @@ LogicalResult OpenFhePkeEmitter::printOperation(arith::AndIOp op) {
   return printBinaryOp(op, op.getLhs(), op.getRhs(), "&&");
 }
 
+LogicalResult OpenFhePkeEmitter::printOperation(arith::OrIOp op) {
+  return printBinaryOp(op, op.getLhs(), op.getRhs(), "||");
+}
+
+LogicalResult OpenFhePkeEmitter::printOperation(arith::XOrIOp op) {
+  return printBinaryOp(op, op.getLhs(), op.getRhs(), "^");
+}
+
 LogicalResult OpenFhePkeEmitter::printOperation(arith::MulFOp op) {
   return printBinaryOp(op, op.getLhs(), op.getRhs(), "*");
 }
@@ -1243,6 +1287,14 @@ LogicalResult OpenFhePkeEmitter::printOperation(arith::MulIOp op) {
 
 LogicalResult OpenFhePkeEmitter::printOperation(arith::SubIOp op) {
   return printBinaryOp(op, op.getLhs(), op.getRhs(), "-");
+}
+
+LogicalResult OpenFhePkeEmitter::printOperation(arith::SubFOp op) {
+  return printBinaryOp(op, op.getLhs(), op.getRhs(), "-");
+}
+
+LogicalResult OpenFhePkeEmitter::printOperation(arith::DivFOp op) {
+  return printBinaryOp(op, op.getLhs(), op.getRhs(), "/");
 }
 
 LogicalResult OpenFhePkeEmitter::printOperation(arith::DivSIOp op) {
@@ -1283,6 +1335,31 @@ LogicalResult OpenFhePkeEmitter::printOperation(arith::CmpIOp op) {
       return printBinaryOp(op, op.getLhs(), op.getRhs(), ">=");
   }
   llvm_unreachable("unknown cmpi predicate kind");
+}
+
+LogicalResult OpenFhePkeEmitter::printOperation(arith::CmpFOp op) {
+  switch (op.getPredicate()) {
+    case arith::CmpFPredicate::OEQ:
+    case arith::CmpFPredicate::UEQ:
+      return printBinaryOp(op, op.getLhs(), op.getRhs(), "==");
+    case arith::CmpFPredicate::ONE:
+    case arith::CmpFPredicate::UNE:
+      return printBinaryOp(op, op.getLhs(), op.getRhs(), "!=");
+    case arith::CmpFPredicate::OLT:
+    case arith::CmpFPredicate::ULT:
+      return printBinaryOp(op, op.getLhs(), op.getRhs(), "<");
+    case arith::CmpFPredicate::OLE:
+    case arith::CmpFPredicate::ULE:
+      return printBinaryOp(op, op.getLhs(), op.getRhs(), "<=");
+    case arith::CmpFPredicate::OGT:
+    case arith::CmpFPredicate::UGT:
+      return printBinaryOp(op, op.getLhs(), op.getRhs(), ">");
+    case arith::CmpFPredicate::OGE:
+    case arith::CmpFPredicate::UGE:
+      return printBinaryOp(op, op.getLhs(), op.getRhs(), ">=");
+    default:
+      return op.emitError("Unsupported cmpf predicate");
+  }
 }
 
 LogicalResult OpenFhePkeEmitter::printOperation(arith::MaxSIOp op) {
@@ -1372,11 +1449,15 @@ LogicalResult OpenFhePkeEmitter::printOperation(tensor::ExtractOp op) {
   }
   os << variableNames->getNameForValue(op.getTensor());
   os << "[";
-  os << flattenIndexExpression(
-      op.getTensor().getType(), op.getIndices(), [&](Value value) {
-        auto constantStr = getStringForConstant(value);
-        return constantStr.value_or(variableNames->getNameForValue(value));
-      });
+  if (op.getIndices().empty()) {
+    os << "0";
+  } else {
+    os << flattenIndexExpression(
+        op.getTensor().getType(), op.getIndices(), [&](Value value) {
+          auto constantStr = getStringForConstant(value);
+          return constantStr.value_or(variableNames->getNameForValue(value));
+        });
+  }
   os << "];\n";
   return success();
 }
@@ -1591,11 +1672,15 @@ LogicalResult OpenFhePkeEmitter::printOperation(tensor::InsertOp op) {
   // dest[idx] = scalar;
   os << variableNames->getNameForValue(op.getDest());
   os << "[";
-  os << flattenIndexExpression(
-      op.getResult().getType(), op.getIndices(), [&](Value value) {
-        auto constantStr = getStringForConstant(value);
-        return constantStr.value_or(variableNames->getNameForValue(value));
-      });
+  if (op.getIndices().empty()) {
+    os << "0";
+  } else {
+    os << flattenIndexExpression(
+        op.getResult().getType(), op.getIndices(), [&](Value value) {
+          auto constantStr = getStringForConstant(value);
+          return constantStr.value_or(variableNames->getNameForValue(value));
+        });
+  }
   os << "]";
   os << " = " << variableNames->getNameForValue(op.getScalar()) << ";\n";
 

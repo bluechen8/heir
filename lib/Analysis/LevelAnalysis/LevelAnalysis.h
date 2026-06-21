@@ -8,6 +8,7 @@
 
 #include "lib/Analysis/SecretnessAnalysis/SecretnessAnalysis.h"
 #include "lib/Dialect/Mgmt/IR/MgmtOps.h"
+#include "lib/Utils/Utils.h"
 #include "llvm/include/llvm/Support/Debug.h"        // from @llvm-project
 #include "llvm/include/llvm/Support/raw_ostream.h"  // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlow/SparseAnalysis.h"  // from @llvm-project
@@ -60,14 +61,6 @@ struct Uninit {
 struct Invalid {
   bool operator==(const Invalid&) const = default;
 };
-
-// Helper for the "overloaded" pattern
-template <class... Ts>
-struct Overloaded : Ts... {
-  using Ts::operator()...;
-};
-template <class... Ts>
-Overloaded(Ts...) -> Overloaded<Ts...>;
 
 // An element of a linear lattice, whose elements are:
 //
@@ -200,7 +193,9 @@ class LevelAnalysis
     : public dataflow::SparseForwardDataFlowAnalysis<LevelLattice>,
       public SecretnessAnalysisDependent<LevelAnalysis> {
  public:
-  using SparseForwardDataFlowAnalysis::SparseForwardDataFlowAnalysis;
+  LevelAnalysis(DataFlowSolver& solver, int levelBudget = 40)
+      : dataflow::SparseForwardDataFlowAnalysis<LevelLattice>(solver),
+        levelBudget(levelBudget) {}
   friend class SecretnessAnalysisDependent<LevelAnalysis>;
 
   void setToEntryState(LevelLattice* lattice) override {
@@ -218,6 +213,9 @@ class LevelAnalysis
   void propagateIfChangedWrapper(AnalysisState* state, ChangeResult changed) {
     propagateIfChanged(state, changed);
   }
+
+ private:
+  int levelBudget;
 };
 
 LevelState deriveResultLevel(Operation* op,
@@ -230,10 +228,10 @@ LevelState deriveResultLevel(Operation* op,
 /// ct-pt pair and determine the level of the pt Value.
 class LevelAnalysisBackward
     : public dataflow::SparseBackwardDataFlowAnalysis<LevelLattice>,
-      public SecretnessAnalysisDependent<LevelAnalysis> {
+      public SecretnessAnalysisDependent<LevelAnalysisBackward> {
  public:
   using SparseBackwardDataFlowAnalysis::SparseBackwardDataFlowAnalysis;
-  friend class SecretnessAnalysisDependent<LevelAnalysis>;
+  friend class SecretnessAnalysisDependent<LevelAnalysisBackward>;
 
   void setToExitState(LevelLattice* lattice) override {
     propagateIfChanged(lattice, lattice->join(LevelState()));

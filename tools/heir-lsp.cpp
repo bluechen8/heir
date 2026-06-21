@@ -1,6 +1,7 @@
 #include "lib/Dialect/BGV/IR/BGVDialect.h"
 #include "lib/Dialect/CGGI/IR/CGGIDialect.h"
 #include "lib/Dialect/CKKS/IR/CKKSDialect.h"
+#include "lib/Dialect/Cheddar/IR/CheddarDialect.h"
 #include "lib/Dialect/Comb/IR/CombDialect.h"
 #include "lib/Dialect/Debug/IR/DebugDialect.h"
 #include "lib/Dialect/Jaxite/IR/JaxiteDialect.h"
@@ -13,6 +14,7 @@
 #include "lib/Dialect/ModArith/IR/ModArithDialect.h"
 #include "lib/Dialect/Openfhe/IR/OpenfheDialect.h"
 #include "lib/Dialect/Polynomial/IR/PolynomialDialect.h"
+#include "lib/Dialect/Preprocessing/IR/PreprocessingDialect.h"
 #include "lib/Dialect/RNS/IR/RNSDialect.h"
 #include "lib/Dialect/Random/IR/RandomDialect.h"
 #include "lib/Dialect/Rotom/IR/RotomDialect.h"
@@ -43,6 +45,7 @@ int main(int argc, char** argv) {
   registry.insert<bgv::BGVDialect>();
   registry.insert<ckks::CKKSDialect>();
   registry.insert<cggi::CGGIDialect>();
+  registry.insert<cheddar::CheddarDialect>();
   registry.insert<comb::CombDialect>();
   registry.insert<debug::DebugDialect>();
   registry.insert<jaxite::JaxiteDialect>();
@@ -54,6 +57,7 @@ int main(int argc, char** argv) {
   registry.insert<mgmt::MgmtDialect>();
   registry.insert<random::RandomDialect>();
   registry.insert<openfhe::OpenfheDialect>();
+  registry.insert<preprocessing::PreprocessingDialect>();
   registry.insert<rns::RNSDialect>();
   registry.insert<rotom::RotomDialect>();
   registry.insert<secret::SecretDialect>();

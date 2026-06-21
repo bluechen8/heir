@@ -44,6 +44,60 @@ def ResetsMulDepthOpInterface : OpInterface<"ResetsMulDepthOpInterface"> {
   }];
 }
 
+def ResetsLevelOpInterface : OpInterface<"ResetsLevelOpInterface"> {
+  let cppNamespace = "::mlir::heir";
+  let description = [{
+    An interface that signals when an operation resets level
+    among its results, such as a `mgmt.bootstrap`.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/"Return the OpOperand whose level is reset.",
+      /*retTy=*/"::mlir::OpOperand&",
+      /*methodName=*/"getOperandToReset",
+      /*args=*/(ins ),
+      /*body=*/[{}],
+      /*defaultBody=*/[{ return $_op->getOpOperand(0); }]
+    >
+  ];
+}
+
+def ReducesLevelOpInterface : OpInterface<"ReducesLevelOpInterface"> {
+  let cppNamespace = "::mlir::heir";
+  let description = [{
+    An interface that signals when an operation reduces level
+    among its results, such as a `mgmt.mod_reduce` or `ckks.rescale`.
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/"Return the number of levels to reduce by.",
+      /*retTy=*/"int",
+      /*methodName=*/"getLevelsToDrop",
+      /*args=*/(ins ),
+      /*body=*/[{}],
+      /*defaultBody=*/[{ return 1; }]
+    >,
+    InterfaceMethod<
+      /*desc=*/"Return the OpOperand whose level is reduced.",
+      /*retTy=*/"::mlir::OpOperand&",
+      /*methodName=*/"getOperandToReduce",
+      /*args=*/(ins ),
+      /*body=*/[{}],
+      /*defaultBody=*/[{ return $_op->getOpOperand(0); }]
+    >
+  ];
+}
+
+def ReducesAllLevelsOpInterface : OpInterface<"ReducesAllLevelsOpInterface"> {
+  let cppNamespace = "::mlir::heir";
+  let description = [{
+    An interface that signals when an operation reduces all level
+    among its results, such as a `mgmt.level_reduce_min`.
+  }];
+}
+
 def LUTOpInterface : OpInterface<"LUTOpInterface"> {
   let cppNamespace = "::mlir::heir";
   let description = [{
@@ -501,4 +555,66 @@ def RotationOpInterface : OpInterface<"RotationOpInterface"> {
     >,
   ];
 }
+def PlaintextEncodeOpInterface : OpInterface<"PlaintextEncodeOpInterface"> {
+  let cppNamespace = "::mlir::heir";
+  let description = [{
+    An interface that marks encode-like operations for preprocessing dataflow analysis.
+  }];
+}
+
+def LimbwiseAttrInterface : AttrInterface<"LimbwiseAttrInterface"> {
+  let description = [{
+    Interface for an attribute that has a concept of limbs. Mainly used
+    to break cyclic build dependencies between ModArith and RNS.
+
+    Used in conjunction with LimbwiseMappableOpInterface to define limb-wise folding
+    by defining just the folder on a single (scalar) residue.
+  }];
+  let cppNamespace = "::mlir::heir";
+  let methods = [
+    InterfaceMethod<
+      "Get an attribute for one limb.",
+      "::mlir::Attribute",
+      "extractLimb",
+      (ins "unsigned":$limbIndex)
+    >,
+    InterfaceMethod<
+      "Get the type of a specific limb.",
+      "::mlir::Type",
+      "getLimbType",
+      (ins "unsigned":$limbIndex)
+    >,
+    StaticInterfaceMethod<
+      "Construct an attribute from a set of limbs.",
+      "::mlir::Attribute",
+      "assembleFromLimbs",
+      (ins "::mlir::Type":$resultAttrType, "::llvm::ArrayRef<::mlir::Attribute>":$limbs)
+    >,
+    InterfaceMethod<
+      "Get the number of limbs.",
+      "unsigned",
+      "getNumLimbs"
+    >,
+    InterfaceMethod<
+      "Materialize a constant operation for this attribute.",
+      "::mlir::Operation *",
+      "materializeConstant",
+      (ins "::mlir::OpBuilder &":$builder, "::mlir::Location":$loc, "::mlir::Type":$type)
+    >,
+  ];
+}
+
+def LimbwiseMappableOpInterface : OpInterface<"LimbwiseMappableOpInterface"> {
+  let cppNamespace = "::mlir::heir";
+  let description = [{
+    Interface for operations that can be folded limbwise.
+  }];
+  let methods = [
+    InterfaceMethod<
+        "Apply folding where each operand is a single residue, a base-case for foldLimbwise.",
+        "::mlir::Attribute", "foldScalarResidue",
+        (ins "::llvm::ArrayRef<::mlir::Attribute>":$operands, "::mlir::Type":$residueType)>
+  ];
+}
+
 #endif  // LIB_DIALECT_HEIR_IR_HEIRINTERFACES_TD_

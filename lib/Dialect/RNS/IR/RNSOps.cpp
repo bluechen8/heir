@@ -1,22 +1,180 @@
 #include "lib/Dialect/RNS/IR/RNSOps.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
+#include "lib/Dialect/ModArith/IR/ModArithAttributes.h"
+#include "lib/Dialect/ModArith/IR/ModArithOps.h"
+#include "lib/Dialect/ModArith/IR/ModArithTypes.h"
 #include "lib/Dialect/RNS/IR/RNSOps.h"
 #include "lib/Dialect/RNS/IR/RNSTypes.h"
+#include "lib/Utils/APIntUtils.h"
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
+#include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
+#include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Builders.h"               // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinAttributes.h"      // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinTypeInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Diagnostics.h"            // from @llvm-project
+#include "mlir/include/mlir/IR/Location.h"               // from @llvm-project
 #include "mlir/include/mlir/IR/MLIRContext.h"            // from @llvm-project
 #include "mlir/include/mlir/IR/OperationSupport.h"       // from @llvm-project
 #include "mlir/include/mlir/IR/Region.h"                 // from @llvm-project
 #include "mlir/include/mlir/IR/TypeUtilities.h"          // from @llvm-project
 #include "mlir/include/mlir/IR/ValueRange.h"             // from @llvm-project
 #include "mlir/include/mlir/Support/LLVM.h"              // from @llvm-project
+#include "mlir/include/mlir/Support/LogicalResult.h"     // from @llvm-project
 
 namespace mlir {
 namespace heir {
 namespace rns {
+
+FailureOr<SmallVector<Value>> computeMixedRadixCoeffs(
+    ImplicitLocOpBuilder& b, Value input,
+    const ArrayRef<mod_arith::ModArithAttr>& qInvProds) {
+  auto rnsTy = dyn_cast<RNSType>(input.getType());
+  if (!rnsTy) {
+    emitError(b.getLoc()) << "expected an RNS value, got " << input.getType();
+    return failure();
+  }
+  int64_t numLimbs = rnsTy.getBasisTypes().size();
+  // qInvProds is the partial products of all moduli: q0, q0*q1, q0*q1*q2, ...,
+  // excluding the product of all the moduli, hence numLimbs-1.
+  if (qInvProds.size() != numLimbs - 1) {
+    emitError(b.getLoc()) << "expected " << numLimbs - 1
+                          << " qInvProds for an RNS basis with " << numLimbs
+                          << " limbs, got " << qInvProds.size();
+    return failure();
+  }
+
+  SmallVector<Value> mrcs;
+
+  // The first mixed-radix coefficient just the lift of the first limb to the
+  // integers
+  auto c0Reduced = ExtractResidueOp::create(b, input, b.getIndexAttr(0));
+  Type intType =
+      cast<mod_arith::ModArithType>(c0Reduced.getType()).getLoweringType();
+  Value c0Lifted = mod_arith::LiftOp::create(b, intType, c0Reduced,
+                                             mod_arith::LiftType::CENTERED);
+  mrcs.push_back(c0Lifted);
+
+  // Subsequent coefficients depend on prior coefficients
+  // c_i = \parens*{x_i - \sum_{j=0}^{i-1} \bracks*{c_j}_{q_j}\cdot
+  // Q_{j-1}}\cdot Q_{i-1}^{-1} \in\Z_{q_i} Here the Q_i's represent partial
+  // products of the limb moduli. Rather than use these values directly, we
+  // evaluate the sum using Horner's method.
+  for (int i = 1; i < numLimbs; i++) {
+    Value xi = ExtractResidueOp::create(b, input, b.getIndexAttr(i));
+    auto limbTy = dyn_cast<mod_arith::ModArithType>(xi.getType());
+    if (!limbTy) {
+      emitError(b.getLoc())
+          << "expected limb type to be mod_arith attribute, got "
+          << xi.getType();
+      return failure();
+    }
+    // Using Horner's method, we compute (c_{i-1}*q_{i-2} + c_{i-2})*q_{i-3} +
+    // c_{i-3} ... We start by reducing c_{i-1} (the previous mixed-radix coeff)
+    // mod, and accumulate into temp.
+    Value temp = mod_arith::EncapsulateOp::create(b, limbTy, mrcs[i - 1]);
+    temp = mod_arith::ReduceOp::create(b, limbTy, temp);
+    if (i > 1) {
+      Value qjConst =
+          mod_arith::ConstantOp::create(b, limbTy, limbTy.getModulus());
+      RankedTensorType tensorTy =
+          RankedTensorType::get({static_cast<int64_t>(mrcs.size())}, intType);
+      Value mrcsTensor = tensor::FromElementsOp::create(b, tensorTy, mrcs);
+      Value zero = arith::ConstantIndexOp::create(b, 0);
+      Value loopBound = arith::ConstantIndexOp::create(b, i - 1);
+      Value upper = arith::ConstantIndexOp::create(b, i - 2);
+      Value one = arith::ConstantIndexOp::create(b, 1);
+      auto loop = scf::ForOp::create(
+          b, zero, loopBound, one, ValueRange{temp},
+          [&](OpBuilder& nestedBuilder, Location nestedLoc, Value index,
+              ValueRange iterArgs) {
+            ImplicitLocOpBuilder b(nestedLoc, nestedBuilder);
+            Value j = arith::SubIOp::create(b, upper, index);
+
+            // reduce c_j mod q_i
+            Value cj = tensor::ExtractOp::create(b, mrcsTensor, ValueRange{j});
+            Value reducedCj = mod_arith::EncapsulateOp::create(b, limbTy, cj);
+            // cj is a centered representative, meaning it could be negative
+            // ModArith doesn't handle negatives well right now, so immediately
+            // put it back in its standard representative mod q
+            reducedCj = mod_arith::ReduceOp::create(b, reducedCj);
+            Value mac = mod_arith::MacOp::create(b, iterArgs.front(), qjConst,
+                                                 reducedCj);
+            scf::YieldOp::create(b, mac);
+          });
+      temp = loop.getResult(0);
+    }
+    Value ci = mod_arith::SubOp::create(b, xi, temp);
+    mod_arith::ModArithAttr maAttr = qInvProds[i - 1];
+    if (maAttr.getType() != limbTy) {
+      emitError(b.getLoc())
+          << "expected qInv attribute type to match limb type " << limbTy
+          << ", got " << maAttr.getType();
+      return failure();
+    }
+    Value qInvConst =
+        mod_arith::ConstantOp::create(b, limbTy, maAttr.getValue());
+    ci = mod_arith::MulOp::create(b, ci, qInvConst);
+    Value liftedCi = mod_arith::LiftOp::create(b, intType, ci,
+                                               mod_arith::LiftType::CENTERED);
+    mrcs.push_back(liftedCi);
+  }
+  return mrcs;
+}
+
+FailureOr<SmallVector<mod_arith::ModArithAttr>> buildQInvProds(
+    mlir::MLIRContext* ctx, rns::RNSType basisTy) {
+  SmallVector<mod_arith::ModArithAttr> qInvProdAttrs;
+  ArrayRef<Type> basisTypes = basisTy.getBasisTypes();
+  if (basisTypes.empty()) {
+    return qInvProdAttrs;
+  }
+  qInvProdAttrs.reserve(basisTypes.size() - 1);
+
+  SmallVector<mod_arith::ModArithType> maBases;
+  for (size_t i = 0; i < basisTypes.size(); ++i) {
+    auto qiTy = dyn_cast<mod_arith::ModArithType>(basisTypes[i]);
+    if (!qiTy) {
+      return failure();
+    }
+    maBases.push_back(qiTy);
+  }
+
+  // If there are k basis elements, we compute
+  // (prod_{j=0..i} q_i)^{-1} mod q_{i+1} for i from 0 to k-2
+  APInt partialProduct(/*numBits=*/1, /*val=*/1);
+  for (size_t i = 0; i < basisTypes.size() - 1; ++i) {
+    mod_arith::ModArithType qiTy = maBases[i];
+    APInt qi = qiTy.getModulus().getValue();
+    unsigned productWidth = partialProduct.getBitWidth() + qi.getBitWidth();
+    partialProduct = partialProduct.zext(productWidth) * qi.zext(productWidth);
+
+    auto modTy = maBases[i + 1];
+    APInt modValue = modTy.getModulus().getValue();
+
+    // Reduce the partial product mod modValue before computing the inverse
+    // to reduce bitwidth
+    APInt reducedPartial =
+        partialProduct.urem(modValue.zext(partialProduct.getBitWidth()))
+            .trunc(modValue.getBitWidth());
+    APInt qInv = multiplicativeInverse(reducedPartial, modValue);
+    if (qInv.isZero()) {
+      return failure();
+    }
+
+    IntegerAttr qInvValue = IntegerAttr::get(
+        modTy.getModulus().getType(),
+        qInv.zextOrTrunc(modTy.getModulus().getValue().getBitWidth()));
+    qInvProdAttrs.push_back(
+        mod_arith::ModArithAttr::get(ctx, modTy, qInvValue));
+  }
+
+  return qInvProdAttrs;
+}
 
 LogicalResult ExtractSliceOp::inferReturnTypes(
     MLIRContext* context, std::optional<Location> loc, ValueRange operands,
@@ -45,6 +203,118 @@ LogicalResult ExtractSliceOp::verify() {
   int64_t size = getSize().getZExtValue();
 
   return verifyExtractSliceOp(this, rnsType, start, size);
+}
+
+// verification for ExtractResidue used in both verify and inferReturnType
+static LogicalResult verifyExtractResidueInput(std::optional<Location> loc,
+                                               Type coeffType, APInt index) {
+  RNSType rnsCoeffType = dyn_cast<RNSType>(getElementTypeOrSelf(coeffType));
+  if (!rnsCoeffType) return failure();
+  int64_t sliceIndex = index.getSExtValue();
+
+  int64_t numLimbs = rnsCoeffType.getBasisTypes().size();
+  if (sliceIndex < 0 || sliceIndex >= numLimbs) {
+    return emitOptionalError(loc, "'rns.extract_residue' index ", sliceIndex,
+                             " is out of bounds for an RNS type with ",
+                             numLimbs, " limbs");
+  }
+
+  auto limbCoeffType = dyn_cast<mod_arith::ModArithType>(
+      rnsCoeffType.getBasisTypes()[sliceIndex]);
+  if (!limbCoeffType) {
+    return emitOptionalError(loc,
+                             "'rns.extract_residue' requires the selected "
+                             "RNS limb to have ModArith type, but found ",
+                             rnsCoeffType.getBasisTypes()[sliceIndex]);
+  }
+
+  return success();
+}
+
+LogicalResult ExtractResidueOp::verify() {
+  return verifyExtractResidueInput(getLoc(), getInput().getType(), getIndex());
+}
+
+LogicalResult ExtractResidueOp::inferReturnTypes(
+    MLIRContext* context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, mlir::PropertyRef properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type>& results) {
+  ExtractResidueOpAdaptor op(operands, attrs, properties, regions);
+  Type ty = op.getInput().getType();
+  APInt index = op.getIndex();
+  if (failed(verifyExtractResidueInput(loc, ty, index))) {
+    return failure();
+  }
+  int64_t sliceIndex = index.getSExtValue();
+  RNSType rnsCoeffType = cast<RNSType>(getElementTypeOrSelf(ty));
+  auto truncatedType =
+      cast<mod_arith::ModArithType>(rnsCoeffType.getBasisTypes()[sliceIndex]);
+
+  Type resultType = truncatedType;
+  if (auto shapedType = dyn_cast<ShapedType>(ty)) {
+    resultType = shapedType.clone(truncatedType);
+  }
+  results.push_back(resultType);
+  return success();
+}
+
+LogicalResult PackOp::inferReturnTypes(
+    MLIRContext* context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, mlir::PropertyRef properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type>& results) {
+  PackOpAdaptor op(operands, attrs, properties, regions);
+  ValueRange input = op.getInput();
+  // There must be at least one item in the list to form an RNS component
+  if (input.empty()) {
+    return emitOptionalError(loc, "'rns.pack' requires at least one input");
+  }
+
+  SmallVector<Type> basisTypes;
+  basisTypes.reserve(input.size());
+  for (Value operand : input) {
+    auto maTy = dyn_cast<mod_arith::ModArithType>(operand.getType());
+    if (!maTy) {
+      return emitOptionalError(loc, "'rns.pack' got input with type ",
+                               operand.getType());
+    }
+    basisTypes.push_back(maTy);
+  }
+  results.push_back(rns::RNSType::get(context, basisTypes));
+  return success();
+}
+
+LogicalResult ConvertBasisOp::inferReturnTypes(
+    MLIRContext* context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, mlir::PropertyRef properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type>& results) {
+  ConvertBasisOpAdaptor op(operands, attrs, properties, regions);
+  auto inputType = dyn_cast<RNSType>(op.getValue().getType());
+  if (!inputType) {
+    return emitOptionalError(loc, "expected RNS input, got ",
+                             op.getValue().getType());
+  }
+  auto targetBasisTy = dyn_cast<RNSType>(op.getTargetBasis());
+  if (!targetBasisTy) {
+    return emitOptionalError(loc, "expected RNS targetBasis, got ",
+                             op.getTargetBasis());
+  }
+  results.push_back(targetBasisTy);
+  return success();
+}
+
+// ConstantOp
+OpFoldResult ConstantOp::fold(FoldAdaptor adaptor) { return getValue(); }
+
+LogicalResult ConstantOp::verify() {
+  auto rnsAttr = dyn_cast<RNSAttr>(getValue());
+  if (!rnsAttr) {
+    return emitOpError() << "expected RNSAttr, but got " << getValue();
+  }
+  if (rnsAttr.getType() != getOutput().getType()) {
+    return emitOpError() << "expected attribute type " << rnsAttr.getType()
+                         << ", but got " << getOutput().getType();
+  }
+  return success();
 }
 
 }  // namespace rns

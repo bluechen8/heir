@@ -2,6 +2,7 @@
 #define LIB_DIALECT_MODARITH_IR_MODARITHOPS_H_
 
 // IWYU pragma: begin_keep
+#include "lib/Dialect/HEIRInterfaces.h"
 #include "lib/Dialect/ModArith/IR/ModArithDialect.h"
 #include "lib/Dialect/ModArith/IR/ModArithTypeInterfaces.h"
 #include "lib/Dialect/ModArith/IR/ModArithTypes.h"
@@ -9,6 +10,8 @@
 #include "mlir/include/mlir/IR/BuiltinTypes.h"  // from @llvm-project
 #include "mlir/include/mlir/Interfaces/InferTypeOpInterface.h"  // from @llvm-project
 // IWYU pragma: end_keep
+
+#include "lib/Dialect/ModArith/IR/ModArithEnums.h.inc"
 
 #define GET_OP_CLASSES
 #include "lib/Dialect/ModArith/IR/ModArithOps.h.inc"

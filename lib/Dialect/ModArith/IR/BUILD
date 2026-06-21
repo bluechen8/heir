@@ -24,14 +24,16 @@ cc_library(
         "ModArithTypes.h",
     ],
     deps = [
-        ":ModArithTypeInterfaces",
+        ":TypeInterfaces",
         ":attributes_inc_gen",
         ":canonicalization_inc_gen",
         ":dialect_inc_gen",
+        ":enums_inc_gen",
         ":ops_inc_gen",
         ":type_interfaces_inc_gen",
         ":types_inc_gen",
-        "@heir//lib/Dialect/RNS/IR:RNSTypeInterfaces",
+        "@heir//lib/Dialect:HEIRInterfaces",
+        "@heir//lib/Dialect/RNS/IR:TypeInterfaces",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:IR",
@@ -41,7 +43,7 @@ cc_library(
 )
 
 cc_library(
-    name = "ModArithTypeInterfaces",
+    name = "TypeInterfaces",
     hdrs = [
         "ModArithTypeInterfaces.h",
     ],
@@ -57,6 +59,7 @@ td_library(
         "ModArithAttributes.td",
         "ModArithCanonicalization.td",
         "ModArithDialect.td",
+        "ModArithEnums.td",
         "ModArithOps.td",
         "ModArithTypes.td",
     ],
@@ -64,6 +67,7 @@ td_library(
     includes = ["../../../.."],
     deps = [
         ":type_interfaces_td",
+        "@heir//lib/Dialect:td_files",
         "@heir//lib/Dialect/RNS/IR:type_interfaces_td",
         "@heir//lib/Utils/DRR",
         "@llvm-project//mlir:ArithOpsTdFiles",
@@ -102,6 +106,17 @@ add_heir_dialect_library(
     dialect_doc_name = "mod_arith",
     kind = "attribute",
     td_file = "ModArithAttributes.td",
+    deps = [
+        ":td_files",
+    ],
+)
+
+add_heir_dialect_library(
+    name = "enums_inc_gen",
+    dialect = "ModArith",
+    dialect_doc_name = "mod_arith",
+    kind = "enum",
+    td_file = "ModArithEnums.td",
     deps = [
         ":td_files",
     ],

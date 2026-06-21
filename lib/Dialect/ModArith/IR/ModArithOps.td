@@ -2,7 +2,9 @@
 #define LIB_DIALECT_MODARITH_IR_MODARITHOPS_TD_
 
 include "lib/Dialect/ModArith/IR/ModArithDialect.td"
+include "lib/Dialect/ModArith/IR/ModArithEnums.td"
 include "lib/Dialect/ModArith/IR/ModArithTypes.td"
+include "lib/Dialect/HEIRInterfaces.td"
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/OpBase.td"
@@ -39,32 +41,31 @@ def ModArith_EncapsulateOp : ModArith_Op<"encapsulate", [Pure]> {
   let assemblyFormat = "operands attr-dict `:` type($input) `->` type($output)";
 }
 
-def ModArith_ExtractOp : ModArith_Op<"extract", [Pure]> {
-  let summary = "extract the integer stored inside mod_arith type";
+def ModArith_LiftOp : ModArith_Op<"lift", [Pure]> {
+  let summary = "lift a modular value to an integer representative";
 
   let description = [{
-    `mod_arith.extract` extracts the integer inside the modular type.
+    `mod_arith.lift` converts a modular value to a canonical integer representative.
+    The `standard` lift produces a representative in `[0, q)`, and the
+    `centered` lift produces a representative in `[-q/2, q/2)`.
 
     It is required that the bitwidth of the output (tensor of) integer type is
     the same as that of the storage type of the input modular type.
 
-    For RNS structure traversal, prefer `rns.extract_slice`.
-
     Examples:
     ```
-    %m0 = mod_arith.encapsulate %c0 : i32 -> mod_arith.int<65537 : i32>
-    %m1 = mod_arith.encapsulate %c1 : i64 -> mod_arith.int<65537 : i64>
-    %c3 = mod_arith.extract %m0 : mod_arith.int<65537 : i32> -> i32
-    %c4 = mod_arith.extract %m1 : mod_arith.int<65537 : i64> -> i64
+    %m0 = mod_arith.lift centered %c0 : i32 -> mod_arith.int<65537 : i32>
+    %m0 = mod_arith.lift standard %c0 : i32 -> mod_arith.int<65537 : i32>
     ```
   }];
 
   let arguments = (ins
-    ModQLike:$input
+    ModArithLike:$input,
+    ModArith_LiftTypeEnum:$lift_type
   );
   let results = (outs SignlessIntegerLike:$output);
   let hasVerifier = 1;
-  let assemblyFormat = "operands attr-dict `:` type($input) `->` type($output)";
+  let assemblyFormat = "$lift_type $input attr-dict `:` type($input) `->` type($output)";
 }
 
 def ModArith_ModSwitchOp : ModArith_Op<"mod_switch", [Pure]> {
@@ -139,7 +140,7 @@ def ModArith_ReduceOp : ModArith_Op<"reduce", [Pure, ElementwiseMappable, SameOp
 }
 
 class ModArith_BinaryOp<string mnemonic, list<Trait> traits = []> :
-    ModArith_Op<mnemonic, traits # [SameOperandsAndResultType, Pure, ElementwiseMappable]>,
+    ModArith_Op<mnemonic, traits # [SameOperandsAndResultType, Pure, ElementwiseMappable, DeclareOpInterfaceMethods<LimbwiseMappableOpInterface, ["foldScalarResidue"]>]>,
     Arguments<(ins ModQLike:$lhs, ModQLike:$rhs)>,
     Results<(outs ModQLike:$output)> {
   let assemblyFormat ="operands attr-dict `:` type($output)";
@@ -181,7 +182,7 @@ def ModArith_MulOp : ModArith_BinaryOp<"mul", [Commutative]> {
   let hasFolder = 1;
 }
 
-def ModArith_MacOp : ModArith_Op<"mac", [SameOperandsAndResultType, Pure, ElementwiseMappable]> {
+def ModArith_MacOp : ModArith_Op<"mac", [SameOperandsAndResultType, Pure, ElementwiseMappable, DeclareOpInterfaceMethods<LimbwiseMappableOpInterface, ["foldScalarResidue"]>]> {
   let summary = "modular multiplication-and-accumulation operation";
 
   let description = [{
@@ -190,9 +191,10 @@ def ModArith_MacOp : ModArith_Op<"mac", [SameOperandsAndResultType, Pure, Elemen
     Unless otherwise specified, the operation assumes all inputs are canonical
     representatives and guarantees the output being canonical representative.
   }];
-  let arguments = (ins ModArithLike:$lhs, ModArithLike:$rhs, ModArithLike:$acc);
-  let results = (outs ModArithLike:$output);
+  let arguments = (ins ModQLike:$lhs, ModQLike:$rhs, ModQLike:$acc);
+  let results = (outs ModQLike:$output);
   let assemblyFormat = "operands attr-dict `:` type($output)";
+  let hasFolder = 1;
 }
 
 // TODO(#1084): migrate barrett/subifge to mod arith type

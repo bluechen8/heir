@@ -9,6 +9,7 @@
 #include "llvm/include/llvm/ADT/STLExtras.h"            // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallVector.h"          // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinAttributes.h"     // from @llvm-project
 #include "mlir/include/mlir/IR/PatternMatch.h"          // from @llvm-project
 #include "mlir/include/mlir/IR/Value.h"                 // from @llvm-project
 #include "mlir/include/mlir/Support/LLVM.h"             // from @llvm-project
@@ -44,6 +45,11 @@ LogicalResult tryFoldLayoutConversionIntoPrevious(
   }
 
   if (auto priorAssignment = op.getValue().getDefiningOp<AssignLayoutOp>()) {
+    if (isa<ArrayAttr>(priorAssignment.getLayout())) {
+      // Don't fold into atomic or complex assignments to prevent performance
+      // regressions.
+      return failure();
+    }
     // merge the conversion into the assignment return success();
     auto newLayout = op.getToLayoutAttr();
     auto domainSchedule = !op.getDomainSchedule().empty()
@@ -109,9 +115,9 @@ LogicalResult HoistArgLayouts::matchAndRewrite(
     auto maybeLayoutOps =
         llvm::map_range(blockArg.getUses(), getFirstLayoutConversionOp);
     if (maybeLayoutOps.empty()) continue;
+    auto layoutOpsVec = llvm::to_vector(maybeLayoutOps);
     auto maybeLayouts = llvm::map_range(
-        llvm::to_vector(maybeLayoutOps),
-        [](auto& maybeLayoutOp) -> std::optional<Attribute> {
+        layoutOpsVec, [](auto& maybeLayoutOp) -> std::optional<Attribute> {
           if (!maybeLayoutOp.has_value()) return std::nullopt;
           auto toLayout = maybeLayoutOp.value().getToLayoutAttr();
           if (!toLayout) return std::nullopt;

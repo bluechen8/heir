@@ -99,7 +99,8 @@ struct LayoutOptimization : impl::LayoutOptimizationBase<LayoutOptimization> {
                                      DataFlowSolver* solver);
 
   // Computes cost of changed result.
-  Cost costOfChangedResult(Operation* kernel, Attribute newLayout);
+  Cost costOfChangedResult(Operation* kernel, Attribute newLayout,
+                           KernelAttr oldKernel, KernelName newKernel);
 
   void runOnOperation() override;
 };
@@ -131,7 +132,7 @@ void LayoutOptimization::runOnOperation() {
               // run automatically instead of doing it manually here
               LLVM_DEBUG(llvm::dbgs() << "Visiting op: " << op->getName()
                                       << " with hoistable interface\n");
-              KernelName kernelName = KernelName::Trivial;
+              [[maybe_unused]] KernelName kernelName = KernelName::Trivial;
               if (op->hasAttr(kKernelAttrName)) {
                 kernelName =
                     op->getAttrOfType<KernelAttr>(kKernelAttrName).getName();
@@ -142,12 +143,6 @@ void LayoutOptimization::runOnOperation() {
                 LLVM_DEBUG(llvm::dbgs()
                            << "Op " << op->getName()
                            << " has no kernel attribute; using trivial\n");
-              }
-
-              if (!::mlir::heir::isSupportedKernel(op, kernelName)) {
-                op->emitOpError()
-                    << "has unsupported kernel: " << kernelName << "\n";
-                return WalkResult::interrupt();
               }
             }
 
@@ -374,9 +369,26 @@ OperandChange LayoutOptimization::costOfChangedOperand(OpOperand& operand,
 }
 
 Cost LayoutOptimization::costOfChangedResult(Operation* kernel,
-                                             Attribute newLayout) {
+                                             Attribute newLayout,
+                                             KernelAttr oldKernel,
+                                             KernelName newKernel) {
+  LLVM_DEBUG(llvm::dbgs() << "Computing cost of changed result to new layout "
+                          << newLayout << "\n");
+
+  // Note: this assumes that trivial kernels have no result layout cost
+  // change. This is true of all current trivial kernels (tensor.collapse_shape
+  // and all arithmetic trivial kernels) and will continue to hold as long as
+  // trivial kernels are implemented with equivalent ciphertext-semantic
+  // operations.
+  if ((oldKernel == nullptr && newKernel == KernelName::Trivial) ||
+      (oldKernel != nullptr && oldKernel.getName() == KernelName::Trivial &&
+       newKernel == KernelName::Trivial)) {
+    return 0;
+  }
+
   Cost totalCost = 0;
   for (auto* user : kernel->getResult(0).getUsers()) {
+    LLVM_DEBUG(llvm::dbgs() << "\tConvert layout use: " << *user << "\n");
     if (auto convertLayoutOp = dyn_cast<ConvertLayoutOp>(user)) {
       Cost originalConversion = costOfLayoutConversion(
           convertLayoutOp.getFromLayout(), convertLayoutOp.getToLayout());
@@ -456,6 +468,24 @@ static FailureOr<Cost> computeKernelCostFromDAG(KernelName kernel,
       return costModel.process(implementedKernel);
     }
 
+    case KernelName::Dot: {
+      auto lhsType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+      if (!lhsType) return failure();
+      auto rhsType = dyn_cast<RankedTensorType>(op->getOperand(1).getType());
+      if (!rhsType) return failure();
+      auto shape = lhsType.getShape();
+      auto dagType = kernel::mlirTypeToDagType(lhsType);
+
+      SymbolicValue lhsVector({shape[0]}, /*isSecret=*/true);
+      SymbolicValue rhsVector({shape[0]}, /*isSecret=*/true);
+
+      auto kernelDag =
+          kernel::implementDot(lhsVector, rhsVector, shape[0], dagType);
+
+      if (!kernelDag) return failure();
+      return costModel.process(kernelDag);
+    }
+
     default:
       return failure();
   }
@@ -463,6 +493,8 @@ static FailureOr<Cost> computeKernelCostFromDAG(KernelName kernel,
 
 static Cost costOfKernelChange(Operation* op, KernelName oldKernel,
                                const HoistResult& hoistResult) {
+  LLVM_DEBUG(llvm::dbgs() << "\tComputing kernel change cost: " << oldKernel
+                          << "\n");
   KernelName newKernel = hoistResult.newKernel;
 
   // No cost if kernel isn't changing
@@ -561,7 +593,8 @@ std::vector<HoistOption> LayoutOptimization::computeHoistingOptions(
                             << totalOperandChangeCost << "\n");
     option.cost += totalOperandChangeCost;
 
-    Cost resultChangeCost = costOfChangedResult(op, outputLayout);
+    Cost resultChangeCost =
+        costOfChangedResult(op, outputLayout, oldKernel, result.newKernel);
     LLVM_DEBUG(llvm::dbgs()
                << "\tresult change cost: " << resultChangeCost << "\n");
     option.cost += resultChangeCost;

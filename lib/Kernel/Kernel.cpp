@@ -20,50 +20,6 @@
 namespace mlir {
 namespace heir {
 
-namespace {
-static std::unordered_map<KernelName, std::vector<std::string>>
-    correspondingOp = {
-        {KernelName::MatvecNaive, {"linalg.matvec"}},
-        {KernelName::MatvecDiagonal,
-         {"linalg.matvec", "linalg.conv_2d_nchw_fchw"}},
-        {KernelName::VecmatDiagonal, {"linalg.vecmat"}},
-        {KernelName::MatmulDiagonal, {"linalg.matmul"}},
-        {KernelName::MatmulDiagonal, {"linalg.conv2d"}},
-        {KernelName::MatmulBicyclic, {"linalg.matmul"}},
-};
-
-std::set<std::string> requiredNontrivial = {"linalg"};
-}  // namespace
-
-bool isSupportedKernel(Operation* op, KernelName name) {
-  std::string dialect = std::string(op->getDialect()->getNamespace());
-  if (name == KernelName::Trivial) {
-    return requiredNontrivial.count(dialect) == 0;
-  }
-
-  auto it = correspondingOp.find(name);
-  if (it == correspondingOp.end()) {
-    LLVM_DEBUG(llvm::dbgs() << "Kernel name " << kernelNameAsStr(name)
-                            << "not found in correspondingOp legality map\n");
-    return false;
-  }
-
-  std::string actual;
-  llvm::raw_string_ostream ss(actual);
-  ss << op->getName().getStringRef();
-
-  auto opForKernelIt = llvm::find(it->second, actual);
-  if (opForKernelIt != it->second.end()) {
-    return true;
-  }
-
-  LLVM_DEBUG(llvm::dbgs() << "Kernel " << kernelNameAsStr(name)
-                          << " is not legal for op " << actual
-                          << ", expected one of ops: "
-                          << llvm::join(it->second, ", ") << "\n");
-  return false;
-}
-
 std::string kernelNameAsStr(const KernelName& kernelName) {
   switch (kernelName) {
     case KernelName::Trivial:
@@ -78,6 +34,8 @@ std::string kernelNameAsStr(const KernelName& kernelName) {
       return "VecmatDiagonal";
     case KernelName::MatmulBicyclic:
       return "MatmulBicyclic";
+    case KernelName::Dot:
+      return "Dot";
     default:
       return "Unknown";
   }

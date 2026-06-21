@@ -124,8 +124,8 @@ void GenericOp::print(OpAsmPrinter& p) {
 }
 
 ValueRange GenericOp::getSuccessorInputs(RegionSuccessor successor) {
-  return successor.isParent() ? ValueRange(getResults())
-                              : ValueRange(getBodyRegion().getArguments());
+  return successor.isOperation() ? ValueRange(getResults())
+                                 : ValueRange(getBodyRegion().getArguments());
 }
 
 static ParseResult parseCommonStructuredOpParts(
@@ -236,6 +236,11 @@ LogicalResult GenericOp::verify() {
 
   // Verify that the operands of the body's basic block are the non-secret
   // analogues of the generic's operands.
+  if (getOperands().size() != body->getNumArguments()) {
+    return emitOpError()
+           << "Number of operands to generic op does not match number of "
+              "block arguments in the body";
+  }
   for (BlockArgument arg : body->getArguments()) {
     auto operand = getOperands()[arg.getArgNumber()];
     auto operandType = dyn_cast<SecretType>(operand.getType());
@@ -789,7 +794,7 @@ void GenericOp::getSuccessorRegions(RegionBranchPoint point,
   if (point == RegionBranchPoint::parent()) {
     regions.push_back(RegionSuccessor(&getRegion()));
   } else {
-    regions.push_back(RegionSuccessor::parent());
+    regions.push_back(RegionSuccessor(getOperation()));
   }
 }
 

@@ -15,6 +15,7 @@
 #include "lib/Transforms/SplitClientInterface/SplitClientInterface.h"
 
 #include "lib/Dialect/ModuleAttributes.h"
+#include "llvm/include/llvm/ADT/DenseMap.h"             // from @llvm-project
 #include "llvm/include/llvm/ADT/DenseSet.h"             // from @llvm-project
 #include "llvm/include/llvm/ADT/STLExtras.h"            // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallVector.h"          // from @llvm-project
@@ -73,18 +74,36 @@ struct SplitClientInterface
 
     if (clientFuncs.empty()) return;
 
-    // Step 2: figure out which symbols each side needs (transitive).
-    // A helper called from both sides gets cloned into both.
+    // Step 2: figure out which symbols each side needs, as a transitive
+    // fixpoint. A helper reachable from a side (possibly through other
+    // helpers) must be available on that side; a helper reachable from
+    // both sides gets cloned into both. The closure must follow the full
+    // call graph: e.g. `forward` (server) may call `forward__preprocessing`
+    // which in turn calls `_assign_layout`, so all three are server-needed
+    // even though `forward` only references the first directly.
+    llvm::DenseMap<llvm::StringRef, func::FuncOp> byName;
+    for (auto fn : module.getOps<func::FuncOp>())
+      byName[fn.getSymName()] = fn;
+
+    auto transitiveClose = [&](llvm::DenseSet<llvm::StringRef>& needs) {
+      llvm::SmallVector<llvm::StringRef> work(needs.begin(), needs.end());
+      while (!work.empty()) {
+        llvm::StringRef name = work.pop_back_val();
+        auto it = byName.find(name);
+        if (it == byName.end()) continue;
+        llvm::DenseSet<llvm::StringRef> refs;
+        collectReferencedSymbols(it->second, refs);
+        for (llvm::StringRef r : refs)
+          if (needs.insert(r).second) work.push_back(r);
+      }
+    };
+
     llvm::DenseSet<llvm::StringRef> clientNeeds;
     llvm::DenseSet<llvm::StringRef> serverNeeds;
-    for (auto fn : clientFuncs) {
-      clientNeeds.insert(fn.getSymName());
-      collectReferencedSymbols(fn, clientNeeds);
-    }
-    for (auto fn : serverFuncs) {
-      serverNeeds.insert(fn.getSymName());
-      collectReferencedSymbols(fn, serverNeeds);
-    }
+    for (auto fn : clientFuncs) clientNeeds.insert(fn.getSymName());
+    for (auto fn : serverFuncs) serverNeeds.insert(fn.getSymName());
+    transitiveClose(clientNeeds);
+    transitiveClose(serverNeeds);
 
     OpBuilder builder(module.getContext());
     builder.setInsertionPointToEnd(module.getBody());

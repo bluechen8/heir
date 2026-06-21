@@ -5,18 +5,22 @@
 #include <utility>
 
 #include "lib/Utils/TensorUtils.h"
+#include "llvm/include/llvm/ADT/DenseSet.h"           // from @llvm-project
 #include "llvm/include/llvm/ADT/STLExtras.h"          // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallBitVector.h"     // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallVector.h"        // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallVectorExtras.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Affine/IR/AffineOps.h"  // from @llvm-project
-#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Linalg/IR/Linalg.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Linalg/IR/LinalgInterfaces.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Linalg/Transforms/Transforms.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Utils/ReshapeOpsUtils.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Utils/StaticValueUtils.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Utils/StructuredOpsUtils.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/AffineExpr.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/Attributes.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinAttributeInterfaces.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinAttributes.h"  // from @llvm-project
@@ -639,6 +643,91 @@ struct RewriteTransposedMatvec
   }
 };
 
+struct RewriteAvgPoolAsConv1D
+    : public OpRewritePattern<mlir::linalg::PoolingNcwSumOp> {
+ public:
+  RewriteAvgPoolAsConv1D(MLIRContext* context)
+      : OpRewritePattern<mlir::linalg::PoolingNcwSumOp>(context) {}
+
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::linalg::PoolingNcwSumOp poolOp,
+                                PatternRewriter& rewriter) const override {
+    auto inputTy = cast<RankedTensorType>(poolOp.getInputs()[0].getType());
+    auto filterTy = cast<RankedTensorType>(poolOp.getInputs()[1].getType());
+    auto outputTy = cast<RankedTensorType>(poolOp.getResultTypes()[0]);
+
+    auto c = inputTy.getDimSize(1);
+    auto eltTy = filterTy.getElementType();
+    auto kernelShape = SmallVector<int64_t>{c, c, filterTy.getDimSize(0)};
+    auto kernelTy = RankedTensorType::get(kernelShape, eltTy);
+
+    // Create kernel value attributes of ones and zeros for the filter.
+    Attribute zeroAttr = rewriter.getZeroAttr(eltTy);
+    Attribute oneAttr = rewriter.getOneAttr(eltTy);
+
+    // If there is a constant division following the sum pool, update the
+    // kernel of ones to be 1 / divValue. This is a common enough pattern since
+    // it represents an average pool.
+    Attribute avgAttr = oneAttr;
+    Value avgPoolOutput;
+    if (poolOp->hasOneUse()) {
+      auto divOp = dyn_cast<arith::DivFOp>(*poolOp->getUsers().begin());
+      if (divOp) {
+        OpOperand& use = *poolOp->getUses().begin();
+        if (auto constantAttr = dyn_cast<Attribute>(getAsOpFoldResult(
+                divOp->getOperand(1 - use.getOperandNumber())))) {
+          if (auto splatAttr = dyn_cast<SplatElementsAttr>(
+                  cast<DenseElementsAttr>(constantAttr))) {
+            auto divValue = splatAttr.getSplatValue<APFloat>();
+            APFloat one = APFloat::getOne(divValue.getSemantics());
+            avgAttr = rewriter.getFloatAttr(eltTy, one / divValue);
+            avgPoolOutput = divOp.getResult();
+          }
+        }
+      }
+    }
+
+    // Build average pooling kernel as a special type of convolution. The kernel
+    // computes a window average, so it is a fixed constant
+    // (1 / divValue) where f == c and zeros where f != c (so each
+    // channel is averaged independently) and strides equal to the pooling
+    // sizes. See
+    // https://machinelearningmastery.com/pooling-layers-for-convolutional-neural-networks/
+    int64_t w = filterTy.getDimSize(0);
+    int64_t numElements = c * c * w;
+    SmallVector<Attribute> values(numElements, zeroAttr);
+
+    for (int64_t f_idx = 0; f_idx < c; ++f_idx) {
+      for (int64_t c_idx = 0; c_idx < c; ++c_idx) {
+        if (f_idx == c_idx) {
+          for (int64_t w_idx = 0; w_idx < w; ++w_idx) {
+            int64_t idx = f_idx * (c * w) + c_idx * w + w_idx;
+            values[idx] = avgAttr;
+          }
+        }
+      }
+    }
+
+    TypedAttr kernelVals = DenseElementsAttr::get(kernelTy, values);
+    auto kernel =
+        arith::ConstantOp::create(rewriter, poolOp.getLoc(), kernelVals);
+    Value conv = linalg::Conv1DNcwFcwOp::create(
+                     rewriter, poolOp.getLoc(), outputTy,
+                     ValueRange{poolOp.getInputs()[0], kernel},
+                     ValueRange{poolOp.getOutputs()[0]}, poolOp.getStrides(),
+                     poolOp.getDilations())
+                     .getResult(0);
+
+    if (avgPoolOutput) {
+      rewriter.replaceAllUsesWith(avgPoolOutput, conv);
+    } else {
+      rewriter.replaceOp(poolOp, conv);
+    }
+    return success();
+  }
+};
+
 struct RewriteAvgPoolAsConv2D
     : public OpRewritePattern<mlir::linalg::PoolingNchwSumOp> {
  public:
@@ -729,128 +818,353 @@ struct RewriteAvgPoolAsConv2D
   }
 };
 
-// Lower linalg.conv_2d_nchw_fchw to a loop of linalg.conv_2d operations.
-struct LowerConv2DNchwFchw
+static SmallVector<int64_t> getBroadcastDimensions(AffineMap map,
+                                                   int64_t numDims) {
+  llvm::SmallDenseSet<unsigned> usedDims;
+  for (auto expr : map.getResults()) {
+    if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+      usedDims.insert(dimExpr.getPosition());
+    }
+  }
+  SmallVector<int64_t> addedDims;
+  for (int i = 0; i < numDims; ++i) {
+    if (usedDims.find(i) == usedDims.end()) {
+      addedDims.push_back(i);
+    }
+  }
+  return addedDims;
+}
+
+/// A rewrite pattern that materializes broadcasts for broadcasting operands in
+/// linalg.generic ops with parallel iterators.
+///
+/// This pattern matches linalg.generic ops where all iterator types are
+/// parallel, and at least one operand has a broadcasting indexing map (i.e.,
+/// the map drops dimensions, mapping a larger iteration space to a smaller
+/// operand space). It creates a linalg.broadcast op for each such operand to
+/// materialize the broadcast, making the operand match the output shape.
+/// This allows subsequent patterns (like LinalgGenericToElementwise) to convert
+/// the op to elementwise operations.
+struct MaterializeBroadcasts : public OpRewritePattern<linalg::GenericOp> {
+ public:
+  MaterializeBroadcasts(MLIRContext* context)
+      : OpRewritePattern<linalg::GenericOp>(context) {}
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter& rewriter) const override {
+    // Only handle ops with multiple inputs to avoid infinite loops when
+    // materializing broadcasts. Single-input broadcast ops don't need to be
+    // converted to elementwise ops.
+    if (genericOp.getNumDpsInputs() <= 1) return failure();
+
+    for (auto iteratorType : genericOp.getIteratorTypesArray()) {
+      if (iteratorType != utils::IteratorType::parallel) {
+        return failure();
+      }
+    }
+
+    auto indexingMaps = genericOp.getIndexingMapsArray();
+    bool madeChanges = false;
+    SmallVector<Value> newInputs;
+    SmallVector<AffineMap> newMaps;
+
+    int64_t numDims = genericOp.getNumLoops();
+
+    for (int64_t i = 0; i < genericOp.getNumDpsInputs(); ++i) {
+      OpOperand* operand = genericOp.getDpsInputOperand(i);
+      AffineMap map = indexingMaps[i];
+      Value value = operand->get();
+
+      if (map.isIdentity()) {
+        newInputs.push_back(value);
+        newMaps.push_back(map);
+        continue;
+      }
+
+      if (map.getNumResults() < numDims) {
+        madeChanges = true;
+        auto materializedValue = materializeBroadcastForOperand(
+            rewriter, genericOp, value, map, numDims);
+        if (failed(materializedValue)) {
+          return failure();
+        }
+        newInputs.push_back(*materializedValue);
+        newMaps.push_back(rewriter.getMultiDimIdentityMap(numDims));
+      } else {
+        newInputs.push_back(value);
+        newMaps.push_back(map);
+      }
+    }
+
+    if (!madeChanges) return failure();
+
+    for (int64_t i = 0; i < genericOp.getNumDpsInits(); ++i) {
+      newMaps.push_back(indexingMaps[genericOp.getNumDpsInputs() + i]);
+    }
+
+    auto newGenericOp = linalg::GenericOp::create(
+        rewriter, genericOp.getLoc(), genericOp.getResultTypes(), newInputs,
+        genericOp.getDpsInits(), newMaps, genericOp.getIteratorTypesArray());
+
+    rewriter.inlineRegionBefore(genericOp.getRegion(), newGenericOp.getRegion(),
+                                newGenericOp.getRegion().begin());
+    rewriter.replaceOp(genericOp, newGenericOp.getResults());
+
+    return success();
+  }
+
+ private:
+  LogicalResult tryCollapseUnitDims(PatternRewriter& rewriter, Location loc,
+                                    Value& value, AffineMap& map,
+                                    int64_t targetRank) const {
+    auto inputType = cast<RankedTensorType>(value.getType());
+    if (inputType.getRank() <= targetRank) return success();
+
+    SmallVector<int64_t> dimsToDrop;
+    for (unsigned j = 0; j < map.getNumResults(); ++j) {
+      auto expr = map.getResult(j);
+      if (auto constExpr = dyn_cast<AffineConstantExpr>(expr)) {
+        if (inputType.getShape()[j] == 1) {
+          dimsToDrop.push_back(j);
+        }
+      }
+    }
+
+    int64_t newRank = inputType.getRank() - dimsToDrop.size();
+    if (dimsToDrop.empty() || newRank > targetRank) {
+      return failure();
+    }
+
+    auto reassociation =
+        getReassociationForReshapeAtDim(inputType.getRank(), dimsToDrop);
+
+    SmallVector<int64_t> targetShape;
+    for (int64_t k = 0; k < inputType.getRank(); ++k) {
+      if (!llvm::is_contained(dimsToDrop, k)) {
+        targetShape.push_back(inputType.getShape()[k]);
+      }
+    }
+
+    auto collapsedType =
+        RankedTensorType::get(targetShape, inputType.getElementType());
+
+    auto collapseOp = tensor::CollapseShapeOp::create(
+        rewriter, loc, collapsedType, value, reassociation);
+
+    value = collapseOp.getResult();
+    map = map.dropResults(dimsToDrop);
+    return success();
+  }
+
+  FailureOr<Value> materializeBroadcastForOperand(PatternRewriter& rewriter,
+                                                  linalg::GenericOp genericOp,
+                                                  Value value, AffineMap map,
+                                                  int64_t numDims) const {
+    SmallVector<int64_t> addedDims = getBroadcastDimensions(map, numDims);
+    int64_t targetRank = numDims - addedDims.size();
+
+    if (failed(tryCollapseUnitDims(rewriter, genericOp.getLoc(), value, map,
+                                   targetRank))) {
+      return failure();
+    }
+
+    auto refOutput = genericOp.getDpsInitOperand(0)->get();
+    auto refOutputType = cast<RankedTensorType>(refOutput.getType());
+
+    auto emptyOp = tensor::EmptyOp::create(rewriter, genericOp.getLoc(),
+                                           refOutputType.getShape(),
+                                           refOutputType.getElementType());
+
+    auto broadcastOp = linalg::BroadcastOp::create(
+        rewriter, genericOp.getLoc(), value, emptyOp.getResult(), addedDims);
+
+    return broadcastOp.getResults()[0];
+  }
+};
+
+struct DropCfAssertInLinalg : public OpRewritePattern<linalg::GenericOp> {
+ public:
+  DropCfAssertInLinalg(MLIRContext* context)
+      : OpRewritePattern<linalg::GenericOp>(context) {}
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter& rewriter) const override {
+    bool madeChanges = false;
+    auto* body = genericOp.getBody();
+    for (auto& op : llvm::make_early_inc_range(body->getOperations())) {
+      if (auto assertOp = dyn_cast<cf::AssertOp>(op)) {
+        rewriter.eraseOp(assertOp);
+        madeChanges = true;
+      }
+    }
+    if (madeChanges) return success();
+    return failure();
+  }
+};
+
+// Rewrites a linalg.conv_1d_ncw_fcw operation with dilation > 1 into an
+// equivalent dilation=1 convolution This materializes the filter to insert
+// `dilation-1` zeros between the filter entries See
+// https://github.com/vdumoulin/conv_arithmetic/blob/af6f818b0bb396c26da79899554682a8a499101d/gif/dilation.gif
+// for a visualization of dilation
+struct UndilateConv1DNcwFcw
+    : public OpRewritePattern<mlir::linalg::Conv1DNcwFcwOp> {
+ public:
+  UndilateConv1DNcwFcw(MLIRContext* context)
+      : OpRewritePattern<mlir::linalg::Conv1DNcwFcwOp>(context) {}
+
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::linalg::Conv1DNcwFcwOp convOp,
+                                PatternRewriter& rewriter) const override {
+    auto dilations = convOp.getDilations();
+    if (!dilations)
+      return rewriter.notifyMatchFailure(convOp, "no dilations attribute");
+    int64_t d = *dilations.getValues<int64_t>().begin();
+
+    if (d == 1) return rewriter.notifyMatchFailure(convOp, "already undilated");
+
+    Value input = convOp.getInputs()[0];
+    Value filter = convOp.getInputs()[1];
+    auto filterTy = cast<RankedTensorType>(filter.getType());
+    if (!filterTy.hasStaticShape())
+      return rewriter.notifyMatchFailure(convOp, "dynamic filter shape");
+
+    // filter is (F, C, KW); dilation acts on KW. New KW' = d*(KW-1) + 1.
+    ArrayRef<int64_t> shape = filterTy.getShape();
+    int64_t f = shape[0], c = shape[1], kw = shape[2];
+    int64_t newKw = d * (kw - 1) + 1;
+    Type eltTy = filterTy.getElementType();
+    auto newFilterTy = filterTy.clone({f, c, newKw});
+
+    TypedAttr constAttr;
+    if (!matchPattern(filter, m_Constant(&constAttr)))
+      return rewriter.notifyMatchFailure(convOp, "filter must be a constant");
+
+    auto denseAttr = dyn_cast<DenseElementsAttr>(constAttr);
+
+    // handle denseResource
+    if (auto denseResourceAttr =
+            dyn_cast<DenseResourceElementsAttr>(constAttr)) {
+      const auto data = denseResourceAttr.getData();
+      // Limit size to avoid huge constants in IR.
+      if (data.size() > 1024 * 1024)
+        return rewriter.notifyMatchFailure(convOp,
+                                           "filter too large to undilate");
+      denseAttr = DenseElementsAttr::getFromRawBuffer(
+          denseResourceAttr.getType(), data);
+    }
+    if (!denseAttr)
+      return rewriter.notifyMatchFailure(
+          convOp, "filter constant must be a dense elements attribute");
+
+    SmallVector<Attribute> values(f * c * newKw, rewriter.getZeroAttr(eltTy));
+    auto inputValues = denseAttr.getValues<Attribute>();
+    for (int64_t fi = 0; fi < f; ++fi) {
+      for (int64_t ci = 0; ci < c; ++ci) {
+        for (int64_t ki = 0; ki < kw; ++ki) {
+          int64_t src = fi * (c * kw) + ci * kw + ki;
+          int64_t dst = fi * (c * newKw) + ci * newKw + ki * d;
+          values[dst] = inputValues[src];
+        }
+      }
+    }
+    Value newFilter = arith::ConstantOp::create(
+        rewriter, convOp.getLoc(), DenseElementsAttr::get(newFilterTy, values));
+
+    rewriter.replaceOpWithNewOp<linalg::Conv1DNcwFcwOp>(
+        convOp, convOp.getResultTypes(), ValueRange{input, newFilter},
+        ValueRange{convOp.getDpsInits()[0]}, convOp.getStrides(),
+        rewriter.getI64TensorAttr({1}));
+    return success();
+  }
+};
+
+// Rewrites a linalg.conv_2d_nchw_fchw operation with dilation > 1 into an
+// equivalent dilation=1 convolution This materializes the filter to insert
+// `dilation-1` zeros between the filter entries See
+// https://github.com/vdumoulin/conv_arithmetic/blob/af6f818b0bb396c26da79899554682a8a499101d/gif/dilation.gif
+// for a visualization of dilation
+struct UndilateConv2DNchwFchw
     : public OpRewritePattern<mlir::linalg::Conv2DNchwFchwOp> {
  public:
-  LowerConv2DNchwFchw(MLIRContext* context)
+  UndilateConv2DNchwFchw(MLIRContext* context)
       : OpRewritePattern<mlir::linalg::Conv2DNchwFchwOp>(context) {}
 
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(mlir::linalg::Conv2DNchwFchwOp convOp,
                                 PatternRewriter& rewriter) const override {
-    // Fails is strides > 1.
-    if (!llvm::all_of(convOp.getStrides(), [](const APInt& element) {
-          return element.getSExtValue() == 1;
-        })) {
-      return rewriter.notifyMatchFailure(convOp,
-                                         "expected all ones for strides");
-    }
+    auto dilations = convOp.getDilations();
+    if (!dilations)
+      return rewriter.notifyMatchFailure(convOp, "no dilations attribute");
+    SmallVector<int64_t> dilationValues =
+        llvm::to_vector(dilations.getValues<int64_t>());
 
-    Location loc = convOp.getLoc();
-    Value image = convOp.getInputs()[0];
+    int64_t dh = dilationValues[0];
+    int64_t dw =
+        (dilationValues.size() > 1) ? dilationValues[1] : dilationValues[0];
+
+    if (dh == 1 && dw == 1)
+      return rewriter.notifyMatchFailure(convOp, "already undilated");
+
+    Value input = convOp.getInputs()[0];
     Value filter = convOp.getInputs()[1];
-    // The output tensor is the initial value for the result.
-    Value output = convOp.getOutputs()[0];
+    auto filterTy = cast<RankedTensorType>(filter.getType());
+    if (!filterTy.hasStaticShape())
+      return rewriter.notifyMatchFailure(convOp, "dynamic filter shape");
 
-    auto imageType = cast<RankedTensorType>(image.getType());
-    auto filterType = cast<RankedTensorType>(filter.getType());
-    auto outputType = cast<RankedTensorType>(output.getType());
+    // filter is (F, C, KH, KW); dilation acts on (KH, KW).
+    // New KH' = dh*(KH-1) + 1 and KW' = dw*(KW-1) + 1.
+    ArrayRef<int64_t> shape = filterTy.getShape();
+    int64_t f = shape[0], c = shape[1], kh = shape[2], kw = shape[3];
+    int64_t newKh = dh * (kh - 1) + 1;
+    int64_t newKw = dw * (kw - 1) + 1;
+    Type eltTy = filterTy.getElementType();
+    auto newFilterTy = filterTy.clone({f, c, newKh, newKw});
 
-    auto imageShape = imageType.getShape();
-    auto filterShape = filterType.getShape();
-    auto outputShape = outputType.getShape();
+    TypedAttr constAttr;
+    if (!matchPattern(filter, m_Constant(&constAttr)))
+      return rewriter.notifyMatchFailure(convOp, "filter must be a constant");
 
-    int64_t n = imageShape[0];
-    int64_t c = imageShape[1];
-    int64_t f = filterShape[0];
+    auto denseAttr = dyn_cast<DenseElementsAttr>(constAttr);
 
-    RankedTensorType twoDType = RankedTensorType::get(
-        {imageShape[2], imageShape[3]}, imageType.getElementType());
-    RankedTensorType outputTwoDType = RankedTensorType::get(
-        {outputShape[2], outputShape[3]}, outputType.getElementType());
-    RankedTensorType filterTwoDType = RankedTensorType::get(
-        {filterShape[2], filterShape[3]}, filterType.getElementType());
+    // handle denseResource
+    if (auto denseResourceAttr =
+            dyn_cast<DenseResourceElementsAttr>(constAttr)) {
+      const auto data = denseResourceAttr.getData();
+      // Limit size to avoid huge constants in IR.
+      if (data.size() > 1024 * 1024)
+        return rewriter.notifyMatchFailure(convOp,
+                                           "filter too large to undilate");
+      denseAttr = DenseElementsAttr::getFromRawBuffer(
+          denseResourceAttr.getType(), data);
+    }
+    if (!denseAttr)
+      return rewriter.notifyMatchFailure(
+          convOp, "filter constant must be a dense elements attribute");
 
-    // Create loops over the batch and filter dimensions.
-    // The loops carry the output tensor being updated.
-    auto nLoop = affine::AffineForOp::create(
-        rewriter, loc, 0, n, 1, ValueRange{output},
-        [&](OpBuilder& b, Location loc, Value nIv, ValueRange iterArgs) {
-          Value iterOutput = iterArgs[0];
-          auto fLoop = affine::AffineForOp::create(
-              b, loc, 0, f, 1, ValueRange{iterOutput},
-              [&](OpBuilder& b, Location loc, Value fIv, ValueRange iterArgs) {
-                // Slice the output to get an init tensor for the convolution
-                // results on each input channel.
-                Value innerIterOutput = iterArgs[0];
-                SmallVector<OpFoldResult> outputOffsets = {
-                    nIv, fIv, b.getIndexAttr(0), b.getIndexAttr(0)};
-                SmallVector<OpFoldResult> outputSizes = {
-                    b.getIndexAttr(1), b.getIndexAttr(1),
-                    b.getIndexAttr(outputShape[2]),
-                    b.getIndexAttr(outputShape[3])};
-                SmallVector<OpFoldResult> outputStrides(4, b.getIndexAttr(1));
-                Value outputSlice = tensor::ExtractSliceOp::create(
-                    b, loc, outputTwoDType, innerIterOutput, outputOffsets,
-                    outputSizes, outputStrides);
+    SmallVector<Attribute> values(f * c * newKh * newKw,
+                                  rewriter.getZeroAttr(eltTy));
+    auto inputValues = denseAttr.getValues<Attribute>();
+    for (int64_t fi = 0; fi < f; ++fi) {
+      for (int64_t ci = 0; ci < c; ++ci) {
+        for (int64_t khi = 0; khi < kh; ++khi) {
+          for (int64_t kwi = 0; kwi < kw; ++kwi) {
+            int64_t src = ((fi * c + ci) * kh + khi) * kw + kwi;
+            int64_t dst = ((fi * c + ci) * newKh + khi * dh) * newKw + kwi * dw;
+            values[dst] = inputValues[src];
+          }
+        }
+      }
+    }
+    Value newFilter = arith::ConstantOp::create(
+        rewriter, convOp.getLoc(), DenseElementsAttr::get(newFilterTy, values));
 
-                // Accumulate over each of the input channels.
-                auto cLoop = affine::AffineForOp::create(
-                    b, loc, 0, c, 1, ValueRange{outputSlice},
-                    [&](OpBuilder& b, Location loc, Value cIv,
-                        ValueRange iterArgs) {
-                      // Slice the image for the current batch.
-                      SmallVector<OpFoldResult> imageOffsets = {
-                          nIv, cIv, b.getIndexAttr(0), b.getIndexAttr(0)};
-                      SmallVector<OpFoldResult> imageSizes = {
-                          b.getIndexAttr(1), b.getIndexAttr(1),
-                          b.getIndexAttr(imageShape[2]),
-                          b.getIndexAttr(imageShape[3])};
-                      SmallVector<OpFoldResult> imageStrides(4,
-                                                             b.getIndexAttr(1));
-                      Value imageSlice = tensor::ExtractSliceOp::create(
-                          b, loc, twoDType, image, imageOffsets, imageSizes,
-                          imageStrides);
-
-                      // Slice the filter for the current filter.
-                      SmallVector<OpFoldResult> filterOffsets = {
-                          fIv, cIv, b.getIndexAttr(0), b.getIndexAttr(0)};
-                      SmallVector<OpFoldResult> filterSizes = {
-                          b.getIndexAttr(1), b.getIndexAttr(1),
-                          b.getIndexAttr(filterShape[2]),
-                          b.getIndexAttr(filterShape[3])};
-                      SmallVector<OpFoldResult> filterStrides(
-                          4, b.getIndexAttr(1));
-                      Value filterSlice = tensor::ExtractSliceOp::create(
-                          b, loc, filterTwoDType, filter, filterOffsets,
-                          filterSizes, filterStrides);
-
-                      // Create a 1x1 conv op for the slices.
-                      Value convOutput = tensor::EmptyOp::create(
-                          b, loc, outputTwoDType.getShape(),
-                          twoDType.getElementType());
-                      auto conv = linalg::Conv2DOp::create(
-                          b, loc, outputTwoDType,
-                          ValueRange{imageSlice, filterSlice},
-                          ValueRange{convOutput});
-
-                      Value accumulatedOutput = arith::AddFOp::create(
-                          b, loc, conv.getResult(0), iterArgs[0]);
-                      affine::AffineYieldOp::create(b, loc, accumulatedOutput);
-                    });
-
-                // Insert the result of the conv back into the output tensor.
-                Value newOutput = tensor::InsertSliceOp::create(
-                    b, loc, cLoop.getResult(0), innerIterOutput, outputOffsets,
-                    outputSizes, outputStrides);
-                affine::AffineYieldOp::create(b, loc, newOutput);
-              });
-          affine::AffineYieldOp::create(b, loc, fLoop.getResults());
-        });
-
-    rewriter.replaceOp(convOp, nLoop.getResults());
+    rewriter.replaceOpWithNewOp<linalg::Conv2DNchwFchwOp>(
+        convOp, convOp.getResultTypes(), ValueRange{input, newFilter},
+        ValueRange{convOp.getDpsInits()[0]}, convOp.getStrides(),
+        rewriter.getI64TensorAttr({1, 1}));
     return success();
   }
 };
@@ -862,14 +1176,16 @@ struct LinalgCanonicalizations
     auto* module = getOperation();
 
     RewritePatternSet patterns(context);
-    patterns.add<FoldConstantLinalgTranspose, FoldConstantFill,
-                 FoldConstantBroadcast, FoldBroadcastExtractSlice,
-                 LinalgMapToElementwise, LinalgGenericToElementwise,
-                 BroadcastToExpandShape, RewriteTransposedVecmat,
-                 RewriteTransposedMatvec, RewriteAvgPoolAsConv2D,
-                 LowerConv2DNchwFchw>(context);
+    patterns.add<
+        BroadcastToExpandShape, DropCfAssertInLinalg, FoldBroadcastExtractSlice,
+        FoldConstantBroadcast, FoldConstantFill, FoldConstantLinalgTranspose,
+        LinalgGenericToElementwise, LinalgMapToElementwise,
+        MaterializeBroadcasts, RewriteAvgPoolAsConv1D, RewriteAvgPoolAsConv2D,
+        RewriteTransposedMatvec, RewriteTransposedVecmat, UndilateConv1DNcwFcw,
+        UndilateConv2DNchwFchw>(context);
 
-    // Run pattern matching and conversion
+    mlir::linalg::populateDecomposeProjectedPermutationPatterns(patterns);
+
     // TODO (#1221): Investigate whether folding (default: on) can be skipped
     // here.
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {

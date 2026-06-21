@@ -28,6 +28,7 @@
 #include "llvm/include/llvm/ADT/SmallVectorExtras.h"       // from @llvm-project
 #include "llvm/include/llvm/ADT/TypeSwitch.h"              // from @llvm-project
 #include "llvm/include/llvm/Support/Debug.h"               // from @llvm-project
+#include "llvm/include/llvm/Support/ErrorHandling.h"       // from @llvm-project
 #include "llvm/include/llvm/Support/FormatVariadic.h"      // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlow/Utils.h"     // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlowFramework.h"  // from @llvm-project
@@ -60,8 +61,11 @@
 namespace mlir {
 namespace heir {
 
+using linalg::Conv1DNcwFcwOp;
+using linalg::Conv1DOp;
 using linalg::Conv2DNchwFchwOp;
 using linalg::Conv2DOp;
+using linalg::DotOp;
 using linalg::MatmulOp;
 using linalg::MatvecOp;
 using linalg::ReduceOp;
@@ -104,7 +108,7 @@ void visitDebugInfo(Operation* op, DataFlowSolver* solver) {
   });
 }
 
-void debugAssignLayout(Value value, LayoutAttr layout) {
+void debugAssignLayout(Value value, Attribute layout) {
   LLVM_DEBUG(llvm::dbgs() << "Assigning layout " << layout << " to value "
                           << value << "\n");
 }
@@ -141,11 +145,14 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
   LogicalResult visitOperation(ExpandShapeOp op);
   LogicalResult visitOperation(GenericOp op);
   LogicalResult visitOperation(ReduceOp op);
+  LogicalResult visitOperation(Conv1DOp op);
+  LogicalResult visitOperation(Conv1DNcwFcwOp op);
   LogicalResult visitOperation(Conv2DOp op);
   LogicalResult visitOperation(Conv2DNchwFchwOp op);
   LogicalResult visitOperation(VecmatOp op);
   LogicalResult visitOperation(MatvecOp op);
   LogicalResult visitOperation(MatmulOp op);
+  LogicalResult visitOperation(DotOp op);
   LogicalResult visitOperation(YieldOp op);
   LogicalResult visitOperation(affine::AffineForOp op);
   LogicalResult visitOperation(func::FuncOp op);
@@ -162,6 +169,9 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
   CompatibilityResult hasCompatibleArgumentLayouts(Operation* op);
 
   // Op-specific compatibility functions
+  CompatibilityResult hasCompatibleArgumentLayouts(DotOp op);
+  CompatibilityResult hasCompatibleArgumentLayouts(Conv1DOp op);
+  CompatibilityResult hasCompatibleArgumentLayouts(Conv1DNcwFcwOp op);
   CompatibilityResult hasCompatibleArgumentLayouts(Conv2DOp op);
   CompatibilityResult hasCompatibleArgumentLayouts(Conv2DNchwFchwOp op);
   CompatibilityResult hasCompatibleArgumentLayouts(ReduceOp op);
@@ -174,6 +184,7 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
   void rectifyIncompatibleOperandLayouts(Operation* op);
 
   // Op-specific overrides
+  void rectifyIncompatibleOperandLayouts(DotOp op);
   void rectifyIncompatibleOperandLayouts(ReduceOp op);
   void rectifyIncompatibleOperandLayouts(tensor::InsertOp op);
   void rectifyIncompatibleOperandLayouts(tensor::InsertSliceOp op);
@@ -196,7 +207,25 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
 
   void runOnOperation() override;
 
-  DenseMap<Value, LayoutAttr> assignedLayouts;
+  LayoutAttr getComposedLayoutAttr(Value v) {
+    Attribute attr = assignedLayouts.at(v);
+    if (auto layoutAttr = dyn_cast<LayoutAttr>(attr)) {
+      return layoutAttr;
+    }
+    if (auto arrayAttr = dyn_cast<ArrayAttr>(attr)) {
+      auto layoutAttrs = arrayAttr.getAsRange<LayoutAttr>();
+      auto it = layoutAttrs.begin();
+      presburger::IntegerRelation composedRel = (*it).getIntegerRelation();
+      ++it;
+      for (; it != layoutAttrs.end(); ++it) {
+        composedRel.compose((*it).getIntegerRelation());
+      }
+      return LayoutAttr::getFromIntegerRelation(&getContext(), composedRel);
+    }
+    llvm_unreachable("unexpected attribute type in assignedLayouts");
+  }
+
+  DenseMap<Value, Attribute> assignedLayouts;
   DataFlowSolver* solver;
 };
 
@@ -228,7 +257,8 @@ FailureOr<AssignLayoutOp> LayoutPropagation::assignDefaultLayoutForOpOperand(
 LogicalResult LayoutPropagation::visitOperation(Operation* op) {
   visitDebugInfo(op, solver);
 
-  if (!isa<func::FuncOp, func::ReturnOp, GenericOp, YieldOp>(op) &&
+  if (!isa<func::FuncOp, func::ReturnOp, GenericOp, YieldOp, AssignLayoutOp>(
+          op) &&
       !isSecret(op->getOperands(), solver) &&
       !isSecret(op->getResults(), solver)) {
     LLVM_DEBUG(llvm::dbgs()
@@ -290,7 +320,8 @@ LogicalResult LayoutPropagation::visitOperation(Operation* op) {
       // secret ops
       .Case<GenericOp, YieldOp>([&](auto op) { return visitOperation(op); })
       // linalg ops
-      .Case<MatvecOp, VecmatOp, ReduceOp, MatmulOp, Conv2DOp, Conv2DNchwFchwOp>(
+      .Case<DotOp, MatvecOp, VecmatOp, ReduceOp, MatmulOp, Conv1DOp,
+            Conv1DNcwFcwOp, Conv2DOp, Conv2DNchwFchwOp>(
           [&](auto op) { return visitOperation(op); })
       // affine ops
       .Case<affine::AffineForOp>([&](auto op) { return visitOperation(op); })
@@ -339,7 +370,7 @@ LogicalResult LayoutPropagation::visitOperation(func::ReturnOp op) {
       // It needs no layout.
       continue;
     }
-    LayoutAttr layout = assignedLayouts.at(operand.get());
+    Attribute layout = assignedLayouts.at(operand.get());
     func.setResultAttr(operand.getOperandNumber(),
                        tensor_ext::TensorExtDialect::kLayoutAttrName, layout);
   }
@@ -353,7 +384,7 @@ LogicalResult LayoutPropagation::visitOperation(GenericOp op) {
       // Assume it is not a tensor type and doesn't need a layout.
       continue;
     }
-    LayoutAttr layout = assignedLayouts.at(operand.get());
+    Attribute layout = assignedLayouts.at(operand.get());
     BlockArgument blockArg =
         op.getRegion().getArgument(operand.getOperandNumber());
     assignedLayouts.insert({blockArg, layout});
@@ -391,7 +422,7 @@ LogicalResult LayoutPropagation::visitOperation(YieldOp op) {
         continue;
       }
     }
-    LayoutAttr layout = assignedLayouts.at(operand.get());
+    Attribute layout = assignedLayouts.at(operand.get());
     Value result = generic.getResult(operand.getOperandNumber());
     assignedLayouts.insert({result, layout});
     debugAssignLayout(result, layout);
@@ -410,7 +441,7 @@ LogicalResult LayoutPropagation::visitOperation(CollapseShapeOp op) {
       op.getSrcType(), op.getResultType(), op.getReassociationIndices());
 
   auto tensor = op.getSrc();
-  LayoutAttr inputLayout = assignedLayouts.at(tensor);
+  LayoutAttr inputLayout = getComposedLayoutAttr(tensor);
   IntegerRelation relation = inputLayout.getIntegerRelation();
 
   relation.applyDomain(rowMajorRelation);
@@ -434,7 +465,7 @@ LogicalResult LayoutPropagation::visitOperation(ExpandShapeOp op) {
         "Only rank-reduced types are supported for ExpandShapeOp");
 
   auto tensor = op.getSrc();
-  LayoutAttr inputLayout = assignedLayouts.at(tensor);
+  LayoutAttr inputLayout = getComposedLayoutAttr(tensor);
   IntegerRelation relation = inputLayout.getIntegerRelation();
   IntegerRelation expandedRelation = expandDimensions(
       relation, op.getResultType(), op.getReassociationIndices());
@@ -466,7 +497,7 @@ LogicalResult LayoutPropagation::visitOperation(VecmatOp op) {
   }
 
   // Assign a row major layout to the input vec.
-  LayoutAttr vecLayout = assignedLayouts.at(vec);
+  LayoutAttr vecLayout = getComposedLayoutAttr(vec);
   if (!isRelationRowMajor(vecType, ciphertextSize,
                           vecLayout.getIntegerRelation())) {
     // Insert a layout conversion op to make the vec layout per-row
@@ -486,7 +517,7 @@ LogicalResult LayoutPropagation::visitOperation(VecmatOp op) {
   auto matrixTransposeType = RankedTensorType::get(
       {matrixType.getDimSize(1), matrixType.getDimSize(0)},
       matrixType.getElementType());
-  LayoutAttr matrixLayout = assignedLayouts.at(matrix);
+  LayoutAttr matrixLayout = getComposedLayoutAttr(matrix);
   IntegerRelation matrixLayoutRelation = matrixLayout.getIntegerRelation();
   auto domainOffset = matrixLayout.getIntegerRelation().getVarKindOffset(
       presburger::VarKind::Domain);
@@ -527,15 +558,10 @@ LogicalResult LayoutPropagation::visitOperation(MatvecOp op) {
   auto matrix = matvecOp.lhs();
   auto matrixType = cast<RankedTensorType>(matrix.getType());
 
-  // Number of rows must be less than or equal to the number of columns.
-  if (matrixType.getDimSize(0) > matrixType.getDimSize(1)) {
-    return op->emitError() << "Matrix rows must be less than columns";
-  }
-
   // TODO(#1597): a layout optimizer should really be selecting the diagonal
   // layout instead of this pass.
 
-  LayoutAttr matrixLayout = assignedLayouts.at(matrix);
+  LayoutAttr matrixLayout = getComposedLayoutAttr(matrix);
   // The Halevi-Shoup kernel (all we support at this time) requires one
   // ciphertext per matrix row.
   if (!isRelationSquatDiagonal(matrixType, ciphertextSize,
@@ -554,7 +580,7 @@ LogicalResult LayoutPropagation::visitOperation(MatvecOp op) {
   // We also require the input to be row-major.
   auto vector = matvecOp.rhs();
   auto vectorType = cast<RankedTensorType>(vector.getType());
-  LayoutAttr vectorLayout = assignedLayouts.at(vector);
+  LayoutAttr vectorLayout = getComposedLayoutAttr(vector);
   if (!isRelationRowMajor(vectorType, ciphertextSize,
                           vectorLayout.getIntegerRelation())) {
     // Insert a layout conversion op to make the matrix layout squat diagonal
@@ -592,6 +618,99 @@ LogicalResult LayoutPropagation::visitOperation(MatvecOp op) {
   return success();
 }
 
+LogicalResult LayoutPropagation::visitOperation(DotOp op) {
+  LLVM_DEBUG(llvm::dbgs() << "visitOperation(DotOp): " << op << "\n");
+  Value result = op.getResult(0);
+  FailureOr<LayoutAttr> layout = defaultLayoutForType(result.getType());
+  if (failed(layout)) {
+    return failure();
+  }
+  assignedLayouts.insert({result, layout.value()});
+  setResultLayoutAttr(op);
+  debugAssignLayout(result, layout.value());
+
+  // Add secret.kernel attribute for Dot
+  MLIRContext* ctx = &getContext();
+  auto kernelAttr =
+      secret::KernelAttr::get(ctx, KernelName::Dot, /*force=*/false);
+  op->setAttr(secret::SecretDialect::kKernelAttrName, kernelAttr);
+
+  return success();
+}
+
+LogicalResult LayoutPropagation::visitOperation(Conv1DOp op) {
+  LLVM_DEBUG(llvm::dbgs() << "Specializing visitor on Conv1DOp\n");
+  Value data = op.getInputs().front();
+  Value filter = op.getInputs().back();
+  auto dataType = cast<RankedTensorType>(data.getType());
+  auto filterType = cast<RankedTensorType>(filter.getType());
+
+  // Flattened data must fit into the ciphertext size.
+  if (dataType.getNumElements() > ciphertextSize) {
+    return op->emitOpError()
+           << "Flattened data must fit into a single ciphertext, but got "
+           << dataType.getNumElements() << " elements and ciphertext size is "
+           << ciphertextSize;
+  }
+
+  MLIRContext* ctx = &getContext();
+  mlir::IRRewriter builder(ctx);
+
+  // TODO(#1597): a layout optimizer should really be selecting the
+  // layout instead of this pass.
+  LayoutAttr dataLayout = getComposedLayoutAttr(data);
+  if (!isRelationRowMajor(dataType, ciphertextSize,
+                          dataLayout.getIntegerRelation())) {
+    LLVM_DEBUG(llvm::dbgs() << "conv_1d data input is not row major, inserting "
+                               "layout conversion.\n");
+    auto [toReplace, newDataLayoutAttr] =
+        convertToLayout(ctx, builder, op, data, dataLayout,
+                        getRowMajorLayoutRelation(dataType, ciphertextSize));
+    debugAssignLayout(toReplace, newDataLayoutAttr);
+    assignedLayouts.insert({toReplace, newDataLayoutAttr});
+  }
+
+  // The kernel for this operation requires expanding the conv filter matrix
+  // into a larger matrix and then diagonalizing.
+  LayoutAttr filterLayout = getComposedLayoutAttr(filter);
+  if (!isRelationConvFilterDiagonalized(filterType, dataType, /*padding=*/0,
+                                        ciphertextSize,
+                                        filterLayout.getIntegerRelation())) {
+    LLVM_DEBUG(llvm::dbgs() << "conv_1d filter input is not diagonalized, "
+                               "inserting layout conversion.\n");
+    // Insert a layout conversion op to make the matrix layout expanded and
+    // squat diagonal
+    auto convRelation = getConvFilterDiagonalizedRelation(
+        filterType, dataType, /*padding=*/0, ciphertextSize);
+    if (failed(convRelation)) {
+      return failure();
+    }
+    auto [toReplace, newFilterLayoutAttr] = convertToLayout(
+        ctx, builder, op, filter, filterLayout, convRelation.value());
+    debugAssignLayout(toReplace, newFilterLayoutAttr);
+    assignedLayouts.insert({toReplace, newFilterLayoutAttr});
+  }
+  // Always one result, and for the kernels we have right now it's always a
+  // row-major replicated vector. Since the
+  // output matrix will have different shape than the input, assign the new
+  // layout.
+  auto result = op->getResult(0);
+  RankedTensorType outputType = cast<RankedTensorType>(result.getType());
+  FailureOr<LayoutAttr> outputLayoutResult = defaultLayoutForType(outputType);
+  if (failed(outputLayoutResult)) {
+    return failure();
+  }
+  LayoutAttr resultLayout = outputLayoutResult.value();
+
+  assignedLayouts.insert({result, resultLayout});
+  setResultLayoutAttr(op);
+  auto kernelAttr =
+      secret::KernelAttr::get(ctx, KernelName::MatvecDiagonal, /*force=*/false);
+  op->setAttr(secret::SecretDialect::kKernelAttrName, kernelAttr);
+
+  return success();
+}
+
 LogicalResult LayoutPropagation::visitOperation(Conv2DOp op) {
   LLVM_DEBUG(llvm::dbgs() << "Specializing visitor on Conv2DOp\n");
   Value data = op.getInputs().front();
@@ -612,7 +731,7 @@ LogicalResult LayoutPropagation::visitOperation(Conv2DOp op) {
 
   // TODO(#1597): a layout optimizer should really be selecting the
   // layout instead of this pass.
-  LayoutAttr dataLayout = assignedLayouts.at(data);
+  LayoutAttr dataLayout = getComposedLayoutAttr(data);
   if (!isRelationRowMajor(dataType, ciphertextSize,
                           dataLayout.getIntegerRelation())) {
     LLVM_DEBUG(llvm::dbgs() << "conv_2d data input is not row major, inserting "
@@ -626,7 +745,7 @@ LogicalResult LayoutPropagation::visitOperation(Conv2DOp op) {
 
   // The kernel for this operation requires expanding the conv filter matrix
   // into a larger matrix and then diagonalizing.
-  LayoutAttr filterLayout = assignedLayouts.at(filter);
+  LayoutAttr filterLayout = getComposedLayoutAttr(filter);
   if (!isRelationConvFilterDiagonalized(filterType, dataType, /*padding=*/0,
                                         ciphertextSize,
                                         filterLayout.getIntegerRelation())) {
@@ -665,6 +784,93 @@ LogicalResult LayoutPropagation::visitOperation(Conv2DOp op) {
   return success();
 }
 
+LogicalResult LayoutPropagation::visitOperation(Conv1DNcwFcwOp op) {
+  LLVM_DEBUG(llvm::dbgs() << "Specializing visitor on Conv1DNcwFcwOp\n");
+  Value data = op.getInputs().front();
+  Value filter = op.getInputs().back();
+  auto dataType = cast<RankedTensorType>(data.getType());
+  auto filterType = cast<RankedTensorType>(filter.getType());
+  RankedTensorType outputType =
+      cast<RankedTensorType>(op.getResult(0).getType());
+
+  bool interchangeRows = true;
+
+  int64_t stride = op.getStrides().getValues<int64_t>().begin()[0];
+
+  MLIRContext* ctx = &getContext();
+  mlir::IRRewriter builder(ctx);
+
+  // Ensure data is in gapped row-major layout with current inputGap.
+  // We expect 3-D tensor (N, C, W) but only support N=1.
+  if (dataType.getRank() != 3 || dataType.getDimSize(0) != 1) {
+    return op->emitOpError() << "Expected 3-D data tensor (N=1, C, W)";
+  }
+
+  // Since the stride will be used as the gap factor, the layout requires that
+  // the number of output channels is divisible by gap.
+  // TODO(#2883): handle padding the output channels to be divisible by gap.
+  if (outputType.getDimSize(1) % stride != 0) {
+    return op->emitOpError()
+           << "Expected number of output channels to be divisible by gap";
+  }
+
+  LayoutAttr dataLayout = getComposedLayoutAttr(data);
+  IntegerRelation targetDataRelation =
+      getRowMajorLayoutRelation(dataType, ciphertextSize);
+
+  if (!dataLayout.getIntegerRelation().isEqual(targetDataRelation)) {
+    LLVM_DEBUG(llvm::dbgs() << "conv_1d data input is not row major, "
+                               "inserting layout conversion.\n");
+    auto [toReplace, newDataLayoutAttr] =
+        convertToLayout(ctx, builder, op, data, dataLayout, targetDataRelation);
+    debugAssignLayout(toReplace, newDataLayoutAttr);
+    assignedLayouts.insert({toReplace, newDataLayoutAttr});
+  }
+
+  // The kernel for this operation requires expanding the conv filter matrix
+  // into a larger matrix and then diagonalizing.
+  LayoutAttr filterLayout = getComposedLayoutAttr(filter);
+  auto convRelation = get1dConvCwFcwFilterDiagonalizedRelation(
+      filterType, dataType, stride, /*padding=*/0, ciphertextSize,
+      /*interchangeRows=*/interchangeRows);
+  if (failed(convRelation)) {
+    return failure();
+  }
+  if (!isRelationEqual(filterLayout.getIntegerRelation(),
+                       convRelation.value())) {
+    LLVM_DEBUG(llvm::dbgs() << "conv_1d filter input is not diagonalized, "
+                               "inserting layout conversion.\n");
+
+    // Insert a layout conversion op to make the matrix layout expanded and
+    // squat diagonal. The added domain schedule ensures ISL can efficiently
+    // generate a loop nest implementing the layout. However, the choice of
+    // which domain indices to include is arbitrary (so long as ISL remains
+    // fast).
+    auto [toReplace, newFilterLayoutAttr] = convertToLayout(
+        ctx, builder, op, filter, filterLayout, convRelation.value(),
+        /*domainSchedule=*/{0, 1});
+    debugAssignLayout(toReplace, newFilterLayoutAttr);
+    assignedLayouts.insert({toReplace, newFilterLayoutAttr});
+  }
+
+  // Always one result. For a gapped output, the result will also have a
+  // row-shuffled gap. Future users may need to insert a layout conversion.
+  auto result = op->getResult(0);
+  presburger::IntegerRelation resultRelation =
+      get1dConvResultRelation(outputType, stride, /*padding=*/0, ciphertextSize,
+                              /*interchangeRows=*/interchangeRows);
+  LayoutAttr resultLayoutAttr =
+      LayoutAttr::getFromIntegerRelation(ctx, resultRelation);
+
+  assignedLayouts.insert({result, resultLayoutAttr});
+  setResultLayoutAttr(op);
+  auto kernelAttr =
+      secret::KernelAttr::get(ctx, KernelName::MatvecDiagonal, /*force=*/false);
+  op->setAttr(secret::SecretDialect::kKernelAttrName, kernelAttr);
+
+  return success();
+}
+
 LogicalResult LayoutPropagation::visitOperation(Conv2DNchwFchwOp op) {
   LLVM_DEBUG(llvm::dbgs() << "Specializing visitor on Conv2DNchwFchwOp\n");
   Value data = op.getInputs().front();
@@ -673,6 +879,8 @@ LogicalResult LayoutPropagation::visitOperation(Conv2DNchwFchwOp op) {
   auto filterType = cast<RankedTensorType>(filter.getType());
   RankedTensorType outputType =
       cast<RankedTensorType>(op.getResult(0).getType());
+
+  bool interchangeRows = false;
 
   SmallVector<int64_t> strides(op.getStrides().getValues<int64_t>().begin(),
                                op.getStrides().getValues<int64_t>().end());
@@ -697,7 +905,7 @@ LogicalResult LayoutPropagation::visitOperation(Conv2DNchwFchwOp op) {
            << "Expected number of output channels to be divisible by gap^2";
   }
 
-  LayoutAttr dataLayout = assignedLayouts.at(data);
+  LayoutAttr dataLayout = getComposedLayoutAttr(data);
   IntegerRelation targetDataRelation =
       getRowMajorLayoutRelation(dataType, ciphertextSize);
 
@@ -712,38 +920,57 @@ LogicalResult LayoutPropagation::visitOperation(Conv2DNchwFchwOp op) {
 
   // The kernel for this operation requires expanding the conv filter matrix
   // into a larger matrix and then diagonalizing.
-  LayoutAttr filterLayout = assignedLayouts.at(filter);
-  auto convRelation = get2dConvChwFchwFilterDiagonalizedRelation(
-      filterType, dataType, strides, /*padding=*/0, ciphertextSize, false);
-  if (failed(convRelation)) {
+  Value originalFilter = filter;
+  if (auto assignOp = filter.getDefiningOp<AssignLayoutOp>()) {
+    originalFilter = assignOp.getValue();
+  }
+  auto maybeRels = get2dConvChwFchwFilterAsSequence(
+      filterType, dataType, strides, /*padding=*/0, ciphertextSize,
+      interchangeRows);
+  if (failed(maybeRels)) {
     return failure();
   }
-  if (!isRelationEqual(filterLayout.getIntegerRelation(),
-                       convRelation.value())) {
-    LLVM_DEBUG(llvm::dbgs() << "conv_2d filter input is not diagonalized, "
-                               "inserting layout conversion.\n");
-
-    // Insert a layout conversion op to make the matrix layout expanded and
-    // squat diagonal. The added domain schedule ensures ISL can efficiently
-    // generate a loop nest implementing the layout. However, the choice of
-    // which domain indices to include is arbitrary (so long as ISL remains
-    // fast).
-    auto [toReplace, newFilterLayoutAttr] = convertToLayout(
-        ctx, builder, op, filter, filterLayout, convRelation.value(),
-        /*domainSchedule=*/{0, 1});
-    debugAssignLayout(toReplace, newFilterLayoutAttr);
-    assignedLayouts.insert({toReplace, newFilterLayoutAttr});
+  auto rels = maybeRels.value();
+  SmallVector<Attribute> layoutAttrs;
+  for (const auto& rel : rels) {
+    layoutAttrs.push_back(LayoutAttr::getFromIntegerRelation(ctx, rel));
   }
+  ArrayAttr layoutList = ArrayAttr::get(ctx, layoutAttrs);
+
+  builder.setInsertionPoint(op);
+  auto assignLayoutOp =
+      AssignLayoutOp::create(builder, op->getLoc(), originalFilter, layoutList);
+
+  Value toReplace = assignLayoutOp.getResult();
+  builder.replaceUsesWithIf(filter, toReplace, [&](OpOperand& otherOperand) {
+    return otherOperand.getOwner() == op;
+  });
+  LayoutAttr composedLayout = LayoutAttr::composeLayouts(layoutList, ctx);
+
+  debugAssignLayout(toReplace, composedLayout);
+  assignedLayouts.insert({toReplace, composedLayout});
+  setAttributeAssociatedWith(
+      toReplace, tensor_ext::TensorExtDialect::kLayoutAttrName, composedLayout);
 
   // Always one result. For a gapped output, the result will also have a
   // pixel-shuffled gap. Future users may need to insert a layout conversion.
   auto result = op->getResult(0);
-  presburger::IntegerRelation resultRelation = get2dConvResultRelation(
-      outputType, strides, /*padding=*/0, ciphertextSize, false);
-  LayoutAttr resultLayoutAttr =
-      LayoutAttr::getFromIntegerRelation(ctx, resultRelation);
+  Attribute resultLayoutAttr;
+  presburger::IntegerRelation rel1 = get2dConvResultRelation(
+      outputType, strides, /*padding=*/0, ciphertextSize);
+
+  if (interchangeRows) {
+    presburger::IntegerRelation rel2 = get2dConvRowInterchangeLayoutRelation(
+        outputType, strides, ciphertextSize);
+    LayoutAttr layout1 = LayoutAttr::getFromIntegerRelation(ctx, rel1);
+    LayoutAttr layout2 = LayoutAttr::getFromIntegerRelation(ctx, rel2);
+    resultLayoutAttr = ArrayAttr::get(ctx, {layout1, layout2});
+  } else {
+    resultLayoutAttr = LayoutAttr::getFromIntegerRelation(ctx, rel1);
+  }
 
   assignedLayouts.insert({result, resultLayoutAttr});
+
   setResultLayoutAttr(op);
   auto kernelAttr =
       secret::KernelAttr::get(ctx, KernelName::MatvecDiagonal, /*force=*/false);
@@ -768,7 +995,7 @@ LogicalResult LayoutPropagation::visitOperation(MatmulOp op) {
   LLVM_DEBUG(llvm::dbgs() << "lhs=" << lhs << ";\nrhs=" << rhs << "\n");
 
   if (inputSecret && filterSecret) {
-    LayoutAttr lhsLayout = assignedLayouts.at(lhs);
+    LayoutAttr lhsLayout = getComposedLayoutAttr(lhs);
     if (!isRelationBicyclic(lhsType, ciphertextSize,
                             lhsLayout.getIntegerRelation())) {
       auto [toReplace, newInputMatrixLayoutAttr] =
@@ -778,7 +1005,7 @@ LogicalResult LayoutPropagation::visitOperation(MatmulOp op) {
       assignedLayouts.insert({toReplace, newInputMatrixLayoutAttr});
     }
 
-    LayoutAttr rhsLayout = assignedLayouts.at(rhs);
+    LayoutAttr rhsLayout = getComposedLayoutAttr(rhs);
     if (!isRelationBicyclic(rhsType, ciphertextSize,
                             rhsLayout.getIntegerRelation())) {
       auto [toReplace, newFilterMatrixLayoutAttr] =
@@ -806,7 +1033,7 @@ LogicalResult LayoutPropagation::visitOperation(MatmulOp op) {
 
   // Assign a per-row layout to the input matrix. Each row of the input matrix
   // will be packed into a separate ciphertext.
-  LayoutAttr lhsLayout = assignedLayouts.at(lhs);
+  auto lhsLayout = getComposedLayoutAttr(lhs);
   if (!isRelationPerRow(lhsType, ciphertextSize,
                         lhsLayout.getIntegerRelation())) {
     // Insert a layout conversion op to make the matrix layout per-row
@@ -820,7 +1047,7 @@ LogicalResult LayoutPropagation::visitOperation(MatmulOp op) {
   // Assign or change the filter matrix a diagonal layout.
   auto rhsTransposeType = RankedTensorType::get(
       {rhsType.getDimSize(1), rhsType.getDimSize(0)}, rhsType.getElementType());
-  LayoutAttr rhsLayout = assignedLayouts.at(rhs);
+  auto rhsLayout = getComposedLayoutAttr(rhs);
   IntegerRelation rhsLayoutRelation = rhsLayout.getIntegerRelation();
   auto clonedFilterMatrixRelation = rhsLayoutRelation.clone();
   auto domainOffset =
@@ -862,7 +1089,7 @@ LogicalResult LayoutPropagation::visitOperation(ReduceOp op) {
 
   for (const auto& [tensor, result] :
        llvm::zip(op.getInputs(), op.getResults())) {
-    LayoutAttr thisLayout = assignedLayouts.at(tensor);
+    LayoutAttr thisLayout = getComposedLayoutAttr(tensor);
 
     // enforce row-major layout
     RankedTensorType thisType = cast<RankedTensorType>(tensor.getType());
@@ -905,7 +1132,7 @@ LogicalResult LayoutPropagation::visitOperation(affine::AffineForOp op) {
       }
       layout = cast<LayoutAttr>(res.value().getLayout());
     } else {
-      layout = assignedLayouts.at(init);
+      layout = getComposedLayoutAttr(init);
     }
     assignedLayouts.insert({iterArg, layout});
     setAttributeAssociatedWith(
@@ -938,7 +1165,7 @@ LogicalResult LayoutPropagation::visitOperation(tensor::InsertOp op) {
   // The scalar input is handled by the generic logic in visitOperation,
   // which will assign a default scalar layout if it is secret and has no
   // layout.
-  LayoutAttr tensorLayout = assignedLayouts.at(op.getDest());
+  LayoutAttr tensorLayout = getComposedLayoutAttr(op.getDest());
   Value result = op.getResult();
   assignedLayouts.insert({result, tensorLayout});
   debugAssignLayout(result, tensorLayout);
@@ -951,7 +1178,7 @@ LogicalResult LayoutPropagation::visitOperation(tensor::InsertSliceOp op) {
   if (!assignedLayouts.contains(op.getDest())) {
     return op->emitError() << "Destination tensor has no assigned layout";
   }
-  LayoutAttr destLayout = assignedLayouts.at(op.getDest());
+  LayoutAttr destLayout = getComposedLayoutAttr(op.getDest());
   Value result = op.getResult();
   assignedLayouts.insert({result, destLayout});
   debugAssignLayout(result, destLayout);
@@ -965,7 +1192,7 @@ LogicalResult LayoutPropagation::visitOperation(tensor::ExtractSliceOp op) {
     return op->emitError() << "Source tensor has no assigned layout";
   }
   IntegerRelation sourceLayout =
-      assignedLayouts.at(op.getSource()).getIntegerRelation();
+      getComposedLayoutAttr(op.getSource()).getIntegerRelation();
 
   FailureOr<IntegerRelation> maybeSliceExtractionLayout =
       getSliceExtractionRelation(op.getSourceType(), op.getResultType(),
@@ -1016,8 +1243,8 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
             affine::AffineYieldOp>(
           [&](auto op) { return CompatibilityResult{true, std::nullopt}; })
       // Ops with special rules
-      .Case<ReduceOp, MatvecOp, VecmatOp, Conv2DOp, Conv2DNchwFchwOp,
-            tensor::InsertSliceOp>(
+      .Case<DotOp, ReduceOp, MatvecOp, VecmatOp, Conv1DOp, Conv1DNcwFcwOp,
+            Conv2DOp, Conv2DNchwFchwOp, tensor::InsertSliceOp>(
           [&](auto op) { return hasCompatibleArgumentLayouts(op); })
       // By default, assume operands must all have the same layout.
       .Default([&](Operation* op) {
@@ -1040,7 +1267,7 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
             return CompatibilityResult{
                 false, op->emitError("operand has no assigned layout")};
           }
-          LayoutAttr layout = assignedLayouts.at(opOperand.get());
+          LayoutAttr layout = getComposedLayoutAttr(opOperand.get());
 
           if (!firstFoundLayout.has_value()) firstFoundLayout = layout;
           if (layout != firstFoundLayout.value()) {
@@ -1050,6 +1277,23 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
 
         return CompatibilityResult{true, std::nullopt};
       });
+}
+
+CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(DotOp op) {
+  LayoutAttr lhsLayout = getComposedLayoutAttr(op.getOperand(0));
+  LayoutAttr rhsLayout = getComposedLayoutAttr(op.getOperand(1));
+
+  if (lhsLayout != rhsLayout) {
+    return {false, std::nullopt};
+  }
+
+  // Outs operand (operand 2) should be 0D.
+  LayoutAttr outsLayout = getComposedLayoutAttr(op.getOperand(2));
+  if (outsLayout.getIntegerRelation().getNumDomainVars() != 0) {
+    return {false, std::nullopt};
+  }
+
+  return {true, std::nullopt};
 }
 
 CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
@@ -1065,8 +1309,8 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
               op->emitError("initializer tensor has no assigned layout")};
     }
 
-    LayoutAttr inputLayout = assignedLayouts.at(input);
-    LayoutAttr initLayout = assignedLayouts.at(init);
+    LayoutAttr inputLayout = getComposedLayoutAttr(input);
+    LayoutAttr initLayout = getComposedLayoutAttr(init);
     LayoutAttr reducedInputLayout =
         convertLayoutForReduce(inputLayout, op.getDimensions());
 
@@ -1117,6 +1361,22 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
 }
 
 CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
+    Conv1DOp op) {
+  // Currently only support secret data and plaintext filters.
+  Value data = op.getInputs().front();
+  Value filter = op.getInputs().back();
+  if (isSecret(filter, solver) || !isSecret(data, solver)) {
+    return {false, op->emitError("Only secret data and plaintext filters are "
+                                 "supported for linalg.conv1d")};
+  }
+
+  if (!assignedLayouts.contains(data)) {
+    return {false, op->emitError("data operand has no assigned layout")};
+  }
+  return {true, std::nullopt};
+}
+
+CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
     Conv2DOp op) {
   // Currently only support secret data and plaintext filters.
   Value data = op.getInputs().front();
@@ -1124,6 +1384,22 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
   if (isSecret(filter, solver) || !isSecret(data, solver)) {
     return {false, op->emitError("Only secret data and plaintext filters are "
                                  "supported for linalg.conv2d")};
+  }
+
+  if (!assignedLayouts.contains(data)) {
+    return {false, op->emitError("data operand has no assigned layout")};
+  }
+  return {true, std::nullopt};
+}
+
+CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
+    Conv1DNcwFcwOp op) {
+  // Currently only support secret data and plaintext filters.
+  Value data = op.getInputs().front();
+  Value filter = op.getInputs().back();
+  if (isSecret(filter, solver) || !isSecret(data, solver)) {
+    return {false, op->emitError("Only secret data and plaintext filters are "
+                                 "supported for linalg.conv_1d_ncw_fcw")};
   }
 
   if (!assignedLayouts.contains(data)) {
@@ -1162,8 +1438,8 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
     return {false, op->emitError("destination tensor has no assigned layout")};
   }
 
-  auto insertLayout = assignedLayouts.at(insert);
-  auto destLayout = assignedLayouts.at(dest);
+  LayoutAttr insertLayout = getComposedLayoutAttr(insert);
+  LayoutAttr destLayout = getComposedLayoutAttr(dest);
   auto destRelation = destLayout.getIntegerRelation();
   auto compatibleDestRelation = pushSliceLayoutThroughInsertSlice(
       SmallVector<int64_t>(op.getStaticSizes()), op.getResultType().getShape(),
@@ -1189,14 +1465,14 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(Operation* op) {
     for (auto operand : op->getOperands()) {
       LayoutAttr operandLayout;
       if (assignedLayouts.contains(operand))
-        operandLayout = assignedLayouts.at(operand);
+        operandLayout = getComposedLayoutAttr(operand);
       note << "\n- Operand: " << operand << "; Layout: " << operandLayout;
     }
   });
 
   TypeSwitch<Operation*>(op)
       // Ops with special rules
-      .Case<ReduceOp, tensor::InsertOp, tensor::InsertSliceOp>(
+      .Case<DotOp, ReduceOp, tensor::InsertOp, tensor::InsertSliceOp>(
           [&](auto op) { return rectifyIncompatibleOperandLayouts(op); })
       .Default([&](Operation* op) {
         // Default target layout is chosen arbitrarily as the first operand's
@@ -1206,11 +1482,11 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(Operation* op) {
         const auto it = llvm::find_if(op->getOperands(), [this](Value pair) {
           return assignedLayouts.contains(pair);
         });
-        LayoutAttr targetLayout = assignedLayouts.at(*it);
+        LayoutAttr targetLayout = getComposedLayoutAttr(*it);
 
         for (auto& opOperand : op->getOpOperands()) {
           if (!assignedLayouts.contains(opOperand.get())) continue;
-          LayoutAttr sourceLayout = assignedLayouts.at(opOperand.get());
+          LayoutAttr sourceLayout = getComposedLayoutAttr(opOperand.get());
 
           if (sourceLayout != targetLayout) {
             builder.setInsertionPoint(op);
@@ -1235,13 +1511,55 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(Operation* op) {
       });
 }
 
+void LayoutPropagation::rectifyIncompatibleOperandLayouts(DotOp op) {
+  mlir::IRRewriter builder(&getContext());
+  builder.setInsertionPoint(op);
+
+  LayoutAttr lhsLayout = getComposedLayoutAttr(op.getOperand(0));
+  LayoutAttr rhsLayout = getComposedLayoutAttr(op.getOperand(1));
+
+  if (lhsLayout != rhsLayout) {
+    // Convert RHS to match LHS layout
+    ConvertLayoutOp convertOp = ConvertLayoutOp::create(
+        builder, op->getLoc(), op.getOperand(1), rhsLayout, lhsLayout);
+    auto* lattice =
+        solver->getOrCreateState<SecretnessLattice>(convertOp.getResult());
+    lattice->getValue().setSecretness(isSecret(op.getOperand(1), solver));
+
+    builder.replaceUsesWithIf(
+        op.getOperand(1), convertOp.getResult(),
+        [&](OpOperand& operand) { return operand.getOwner() == op; });
+    assignedLayouts.insert({convertOp.getResult(), lhsLayout});
+  }
+
+  // Ensure Outs is 0D.
+  LayoutAttr outsLayout = getComposedLayoutAttr(op.getOperand(2));
+  if (outsLayout.getIntegerRelation().getNumDomainVars() != 0) {
+    FailureOr<LayoutAttr> default0D =
+        defaultLayoutForType(op.getOperand(2).getType());
+    if (succeeded(default0D)) {
+      ConvertLayoutOp convertOp =
+          ConvertLayoutOp::create(builder, op->getLoc(), op.getOperand(2),
+                                  outsLayout, default0D.value());
+      auto* lattice =
+          solver->getOrCreateState<SecretnessLattice>(convertOp.getResult());
+      lattice->getValue().setSecretness(isSecret(op.getOperand(2), solver));
+
+      builder.replaceUsesWithIf(
+          op.getOperand(2), convertOp.getResult(),
+          [&](OpOperand& operand) { return operand.getOwner() == op; });
+      assignedLayouts.insert({convertOp.getResult(), default0D.value()});
+    }
+  }
+}
+
 void LayoutPropagation::rectifyIncompatibleOperandLayouts(ReduceOp op) {
   mlir::IRRewriter builder(&getContext());
   builder.setInsertionPoint(op);
 
   for (const auto& [input, init] : llvm::zip(op.getInputs(), op.getInits())) {
-    LayoutAttr inputLayout = assignedLayouts.at(input);
-    LayoutAttr initLayout = assignedLayouts.at(init);
+    LayoutAttr inputLayout = getComposedLayoutAttr(input);
+    LayoutAttr initLayout = getComposedLayoutAttr(init);
     LayoutAttr reducedInputLayout =
         convertLayoutForReduce(inputLayout, op.getDimensions());
 
@@ -1261,7 +1579,7 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(ReduceOp op) {
 void LayoutPropagation::rectifyIncompatibleOperandLayouts(
     tensor::InsertSliceOp op) {
   // Update the dest tensor to align with the source tensor slice.
-  LayoutAttr sliceLayout = assignedLayouts.at(op.getSource());
+  LayoutAttr sliceLayout = getComposedLayoutAttr(op.getSource());
   auto maybeNewLayout = pushSliceLayoutThroughInsertSlice(
       SmallVector<int64_t>(op.getStaticSizes()), op.getResultType().getShape(),
       sliceLayout.getIntegerRelation());
@@ -1276,7 +1594,7 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(
 
   mlir::IRRewriter builder(&getContext());
   builder.setInsertionPoint(op);
-  LayoutAttr destLayout = assignedLayouts.at(op.getDest());
+  LayoutAttr destLayout = getComposedLayoutAttr(op.getDest());
   auto convertLayoutOp = ConvertLayoutOp::create(
       builder, op->getLoc(), op.getDest(), destLayout, newLayoutAttr);
   Value toReplace = convertLayoutOp.getResult();
@@ -1297,8 +1615,8 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(tensor::InsertOp op) {
   mlir::IRRewriter builder(&getContext());
   builder.setInsertionPoint(op);
 
-  LayoutAttr destLayout = assignedLayouts.at(op.getDest());
-  LayoutAttr scalarLayout = assignedLayouts.at(op.getScalar());
+  LayoutAttr destLayout = getComposedLayoutAttr(op.getDest());
+  LayoutAttr scalarLayout = getComposedLayoutAttr(op.getScalar());
   IntegerRelation destRel = destLayout.getIntegerRelation();
   std::optional<int64_t> destNumCts = destRel.getConstantBound64(
       presburger::BoundType::UB,
@@ -1325,7 +1643,7 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(tensor::InsertOp op) {
 
 void LayoutPropagation::passLayoutThroughOp(Operation* op) {
   // All inputs have the same layout, so just propagate it to all results
-  LayoutAttr layout = assignedLayouts.at(op->getOperand(0));
+  LayoutAttr layout = getComposedLayoutAttr(op->getOperand(0));
   for (Value result : op->getResults()) {
     assignedLayouts.insert({result, layout});
     debugAssignLayout(result, layout);
@@ -1357,7 +1675,17 @@ FailureOr<LayoutAttr> LayoutPropagation::defaultLayoutForType(Type type) {
 
   RankedTensorType tensorType = dyn_cast<RankedTensorType>(ty);
   if (!tensorType) {
+    LLVM_DEBUG(llvm::dbgs() << "defaultLayoutForType: not a tensor, calling "
+                               "defaultLayoutForScalarType\n");
     return defaultLayoutForScalarType(ty);
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "defaultLayoutForType: tensor rank="
+                          << tensorType.getRank() << "\n");
+  if (tensorType.getRank() == 0) {
+    LLVM_DEBUG(llvm::dbgs() << "defaultLayoutForType: rank 0 tensor, calling "
+                               "defaultLayoutForScalarType\n");
+    return defaultLayoutForScalarType(tensorType.getElementType());
   }
 
   // By default, each tensor is laid out in row-major order. The slots will be

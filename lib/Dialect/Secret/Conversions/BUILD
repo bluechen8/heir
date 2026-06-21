@@ -11,6 +11,7 @@ cc_library(
     hdrs = ["Patterns.h"],
     deps = [
         "@heir//lib/Dialect:ModuleAttributes",
+        "@heir//lib/Dialect/Debug/IR:Dialect",
         "@heir//lib/Dialect/LWE/IR:Dialect",
         "@heir//lib/Dialect/Mgmt/IR:Dialect",
         "@heir//lib/Dialect/Polynomial/IR:Dialect",
@@ -24,6 +25,7 @@ cc_library(
         "@llvm-project//mlir:DialectUtils",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:SCFDialect",
         "@llvm-project//mlir:Support",
         "@llvm-project//mlir:TensorDialect",
         "@llvm-project//mlir:TransformUtils",

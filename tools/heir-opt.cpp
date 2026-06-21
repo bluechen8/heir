@@ -16,13 +16,16 @@
 #include "lib/Dialect/CGGI/Transforms/Passes.h"
 #include "lib/Dialect/CKKS/IR/CKKSDialect.h"
 #include "lib/Dialect/CKKS/Transforms/Passes.h"
+#include "lib/Dialect/Cheddar/IR/CheddarDialect.h"
 #include "lib/Dialect/Comb/IR/CombDialect.h"
 #include "lib/Dialect/Debug/IR/DebugDialect.h"
 #include "lib/Dialect/Debug/Transforms/Passes.h"
 #include "lib/Dialect/HEIRInterfaces.h"
 #include "lib/Dialect/Jaxite/IR/JaxiteDialect.h"
 #include "lib/Dialect/JaxiteWord/IR/JaxiteWordDialect.h"
+#include "lib/Dialect/JaxiteWord/Transforms/Passes.h"
 #include "lib/Dialect/KeyMgmt/IR/KeyMgmtDialect.h"
+#include "lib/Dialect/LWE/Conversions/LWEToJaxiteWord/LWEToJaxiteWord.h"
 #include "lib/Dialect/LWE/Conversions/LWEToLattigo/LWEToLattigo.h"
 #include "lib/Dialect/LWE/Conversions/LWEToLinalg/LWEToLinalg.h"
 #include "lib/Dialect/LWE/Conversions/LWEToOpenfhe/LWEToOpenfhe.h"
@@ -30,6 +33,7 @@
 #include "lib/Dialect/LWE/IR/LWEDialect.h"
 #include "lib/Dialect/LWE/Transforms/Passes.h"
 #include "lib/Dialect/Lattigo/IR/LattigoDialect.h"
+#include "lib/Dialect/Lattigo/Transforms/BufferizableOpInterfaceImpl.h"
 #include "lib/Dialect/Lattigo/Transforms/Passes.h"
 #include "lib/Dialect/MathExt/IR/MathExtDialect.h"
 #include "lib/Dialect/Mgmt/IR/MgmtDialect.h"
@@ -43,7 +47,11 @@
 #include "lib/Dialect/Polynomial/Conversions/PolynomialToModArith/PolynomialToModArith.h"
 #include "lib/Dialect/Polynomial/IR/PolynomialDialect.h"
 #include "lib/Dialect/Polynomial/Transforms/Passes.h"
+#include "lib/Dialect/Preprocessing/Conversions/PreprocessingToMemref/PreprocessingToMemref.h"
+#include "lib/Dialect/Preprocessing/IR/PreprocessingDialect.h"
+#include "lib/Dialect/Preprocessing/Transforms/Passes.h"
 #include "lib/Dialect/RNS/IR/RNSDialect.h"
+#include "lib/Dialect/RNS/Transforms/Passes.h"
 #include "lib/Dialect/Random/IR/RandomDialect.h"
 #include "lib/Dialect/Rotom/IR/RotomDialect.h"
 #include "lib/Dialect/Rotom/Transforms/Passes.h"
@@ -73,8 +81,10 @@
 #include "lib/Transforms/SplitClientInterface/SplitClientInterface.h"
 #include "lib/Transforms/CheckNoRingDimBump/CheckNoRingDimBump.h"
 #include "lib/Transforms/IsolateServerModule/IsolateServerModule.h"
+#include "lib/Transforms/AnnotateLevel/AnnotateLevel.h"
 #include "lib/Transforms/AnnotateModule/AnnotateModule.h"
 #include "lib/Transforms/AnnotateMulDepth/AnnotateMulDepth.h"
+#include "lib/Transforms/AnnotatePreprocessing/AnnotatePreprocessing.h"
 #include "lib/Transforms/AnnotateSecretness/AnnotateSecretness.h"
 #include "lib/Transforms/ApplyFolders/ApplyFolders.h"
 #include "lib/Transforms/BooleanVectorizer/BooleanVectorizer.h"
@@ -104,6 +114,7 @@
 #include "lib/Transforms/LayoutPropagation/InterfaceImpl.h"
 #include "lib/Transforms/LayoutPropagation/LayoutPropagation.h"
 #include "lib/Transforms/LinalgCanonicalizations/LinalgCanonicalizations.h"
+#include "lib/Transforms/LinalgFuseLinearOps/LinalgFuseLinearOps.h"
 #include "lib/Transforms/LowerPolynomialEval/LowerPolynomialEval.h"
 #include "lib/Transforms/LowerUnpack/LowerUnpack.h"
 #include "lib/Transforms/OperationBalancer/OperationBalancer.h"
@@ -194,6 +205,7 @@ int main(int argc, char** argv) {
   registry.insert<bgv::BGVDialect>();
   registry.insert<ckks::CKKSDialect>();
   registry.insert<cggi::CGGIDialect>();
+  registry.insert<cheddar::CheddarDialect>();
   registry.insert<comb::CombDialect>();
   registry.insert<debug::DebugDialect>();
   registry.insert<jaxite::JaxiteDialect>();
@@ -205,6 +217,7 @@ int main(int argc, char** argv) {
   registry.insert<random::RandomDialect>();
   registry.insert<orion::OrionDialect>();
   registry.insert<openfhe::OpenfheDialect>();
+  registry.insert<preprocessing::PreprocessingDialect>();
   registry.insert<rns::RNSDialect>();
   registry.insert<rotom::RotomDialect>();
   registry.insert<secret::SecretDialect>();
@@ -307,9 +320,13 @@ int main(int argc, char** argv) {
   mgmt::registerMgmtPasses();
   openfhe::registerOpenfhePasses();
   polynomial::registerPolynomialPasses();
-  rotom::registerRotomPasses();
+  preprocessing::registerPreprocessingPasses();
+  rns::registerRNSPasses();
+  rotom::registerRotomMaterializePasses();
+  rotom::registerRotomSeedPasses();
   secret::registerSecretPasses();
   tensor_ext::registerTensorExtPasses();
+  jaxiteword::registerJaxiteWordPasses();
   registerAddClientInterfacePass();
   registerSplitClientInterfacePass();
   registerIsolateServerModulePass();
@@ -329,7 +346,9 @@ int main(int argc, char** argv) {
   registerConvertToCiphertextSemanticsPasses();
   registerDropUnitDims();
   registerAnnotateModulePasses();
+  registerAnnotatePreprocessingPasses();
   registerAnnotateSecretnessPasses();
+  registerAnnotateLevelPasses();
   registerAnnotateMulDepthPasses();
   registerApplyFoldersPasses();
   registerBooleanVectorizerPasses();
@@ -354,6 +373,7 @@ int main(int argc, char** argv) {
   registerLayoutPropagationPasses();
   registerLayoutOptimizationPasses();
   registerLinalgCanonicalizationsPasses();
+  registerLinalgFuseLinearOpsPasses();
   registerReductionCanonicalizationsPasses();
   registerFoldConstantTensorsPasses();
   registerLowerPolynomialEvalPasses();
@@ -399,6 +419,7 @@ int main(int argc, char** argv) {
 
   // Dialect conversion passes in HEIR
   bgv::registerBGVToLWEPasses();
+  lwe::registerLWEToJaxiteWordPasses();
   lwe::registerLWEToLattigoPasses();
   lwe::registerLWEToLinalgPasses();
   lwe::registerLWEToOpenfhePasses();
@@ -413,6 +434,7 @@ int main(int argc, char** argv) {
   registerCGGIToJaxitePasses();
   registerCGGIToTfheRustBoolPasses();
   registerCGGIToTfheRustPasses();
+  preprocessing::registerPreprocessingToMemrefPasses();
   registerSecretToBGVPasses();
   registerSecretToCGGIPasses();
   registerSecretToCKKSPasses();
@@ -432,6 +454,7 @@ int main(int argc, char** argv) {
 
   // Interfaces in HEIR
   secret::registerBufferizableOpInterfaceExternalModels(registry);
+  lattigo::registerBufferizableOpInterfaceExternalModels(registry);
   registerIncreasesMulDepthOpInterface(registry);
   registerLayoutConversionHoistableInterface(registry);
   registerOperandAndResultAttrInterface(registry);
@@ -555,7 +578,7 @@ int main(int argc, char** argv) {
       "polynomial approximations.",
       mathToPolynomialApproximationBuilder);
 
-  PassPipelineRegistration<TorchLinalgToCkksPipelineOptions>(
+  PassPipelineRegistration<MlirToRLWEPipelineOptions>(
       "torch-linalg-to-ckks", "Convert linalg MLIR exported from torch to CKKS",
       torchLinalgToCkksBuilder);
 

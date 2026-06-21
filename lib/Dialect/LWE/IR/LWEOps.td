@@ -78,7 +78,7 @@ class LWE_CiphertextPlaintextOp<string mnemonic, list<Trait> traits = []> :
   let results = (outs LWECiphertextLike:$output);
 }
 
-def LWE_EncodeOp : LWE_Op<"encode"> {
+def LWE_EncodeOp : LWE_Op<"encode", [PlaintextEncodeOpInterface]> {
   let summary = "Encodes a cleartext into a plaintext";
   let description = [{
     The `encode` op encodes a cleartext into a plaintext. It takes the
@@ -190,6 +190,7 @@ def LWE_RLWEEncodeOp : LWE_Op<"rlwe_encode", [
       // result type is tensor<3x!pt>.
       "mappedDimensionsForOperand",
     ]>,
+    PlaintextEncodeOpInterface,
 ]> {
   let summary = "Encode an integer to yield an RLWE plaintext";
   let description = [{
@@ -336,6 +337,40 @@ def LWE_ConvertBasisOp : LWE_Op<"convert_basis", [Pure, DeclareOpInterfaceMethod
     LWERingElt:$output
   );
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($output)";
+}
+
+def LWE_KeySwitchInnerOp : LWE_Op<"key_switch_inner", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface, ["inferReturnTypes"]>]> {
+  let summary = "Fundamental key-switching kernel.";
+  let description = [{
+    The key-switching key is the encryption of a key `s_{in}` under the key `s_{out}`.
+    The input `value` is a ring element of a ciphertext that gets multiplied with
+    `s_{in}`. KeySwitchInner outputs a linear ciphertext `ct'` such that decrypting
+    `ct'` under `s_{out}` is `value * s_{in}`. By adding `ct'` to the components
+    of the original ciphertext that do are *not* multiplied by `s_{in}`, we obtain
+    a ciphertext that encrypts the same message as the original ciphertext, but under
+    `s_{out}`.
+
+    Using relinearization as an example, a ciphertext `[c_0, c_1, c_2]` decrypts as
+    `c_0 + c_1*s + c_2*s^2`, and the key-switch key is an encryption of `s^2` under `s`.
+    Then we apply `KeySwitchInner` to `c_2`, which produces `[c_0', c_1']`, where
+    `c_0'+c_1'*s = c_2 * s^2`. Then relinearization outputs `[c_0+c_0', c_1+c_1']`.
+
+    This operation is intended to be an internal implementation detail of
+    higher-level ciphertext operations such as `ckks.relinearize`, isolated
+    here for reuse among multiple op lowerings.
+
+    The basis of the `keySwitchingKey`s must be the basis of `value` concatenated
+    with the key-switching primes.
+  }];
+  let arguments = (ins
+      LWERingElt:$value,
+      RankedTensorOf<[LWECiphertext]>: $keySwitchingKey
+  );
+  let results = (outs
+    LWERingElt:$constTerm,
+    LWERingElt:$linearTerm
+  );
+  let hasVerifier = 1;
 }
 
 #endif  // LIB_DIALECT_LWE_IR_LWEOPS_TD_

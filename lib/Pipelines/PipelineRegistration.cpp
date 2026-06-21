@@ -2,6 +2,7 @@
 
 #include "lib/Dialect/ModArith/Conversions/ModArithToArith/ModArithToArith.h"
 #include "lib/Dialect/Polynomial/Conversions/PolynomialToModArith/PolynomialToModArith.h"
+#include "lib/Dialect/RNS/Transforms/LowerConvertBasis.h"
 #include "lib/Transforms/ConvertIfToSelect/ConvertIfToSelect.h"
 #include "lib/Transforms/ConvertSecretExtractToStaticExtract/ConvertSecretExtractToStaticExtract.h"
 #include "lib/Transforms/ConvertSecretForToStaticFor/ConvertSecretForToStaticFor.h"
@@ -33,18 +34,33 @@ using mlir::func::FuncOp;
 
 namespace mlir::heir {
 
-void oneShotBufferize(OpPassManager& manager) {
+void prepareForBufferize(OpPassManager& manager) {
+  manager.addNestedPass<FuncOp>(createConvertElementwiseToLinalgPass());
+  // Needed to lower affine.map and affine.apply
+  manager.addNestedPass<FuncOp>(affine::createAffineExpandIndexOpsPass());
+  manager.addNestedPass<FuncOp>(affine::createSimplifyAffineStructuresPass());
+  manager.addPass(createLowerAffinePass());
+  manager.addNestedPass<FuncOp>(memref::createExpandOpsPass());
+  manager.addNestedPass<FuncOp>(memref::createExpandStridedMetadataPass());
+}
+
+void oneShotBufferize(OpPassManager& manager, bool includeDeallocation) {
   // One-shot bufferize, from
   // https://mlir.llvm.org/docs/Bufferization/#ownership-based-buffer-deallocation
   bufferization::OneShotBufferizePassOptions bufferizationOptions;
   bufferizationOptions.bufferizeFunctionBoundaries = true;
+  bufferizationOptions.allowReturnAllocsFromLoops = true;
   manager.addPass(
       bufferization::createOneShotBufferizePass(bufferizationOptions));
   manager.addPass(memref::createExpandReallocPass());
-  manager.addPass(bufferization::createOwnershipBasedBufferDeallocationPass());
-  manager.addPass(createCanonicalizerPass());
-  manager.addPass(bufferization::createBufferDeallocationSimplificationPass());
-  manager.addPass(bufferization::createLowerDeallocationsPass());
+  if (includeDeallocation) {
+    manager.addPass(
+        bufferization::createOwnershipBasedBufferDeallocationPass());
+    manager.addPass(createCanonicalizerPass());
+    manager.addPass(
+        bufferization::createBufferDeallocationSimplificationPass());
+    manager.addPass(bufferization::createLowerDeallocationsPass());
+  }
   manager.addPass(createCSEPass());
   manager.addPass(mlir::createConvertBufferizationToMemRefPass());
   manager.addPass(createCanonicalizerPass());
@@ -67,19 +83,12 @@ void polynomialToLLVMPipelineBuilder(OpPassManager& manager) {
   elementwiseOptions.convertDialects = {"polynomial"};
   manager.addPass(createElementwiseToAffine(elementwiseOptions));
   manager.addPass(polynomial::createPolynomialToModArith());
+  manager.addPass(rns::createLowerConvertBasis());
   manager.addPass(::mlir::heir::mod_arith::createModArithToArith());
   manager.addPass(createCanonicalizerPass());
 
-  // Linalg
-  manager.addNestedPass<FuncOp>(createConvertElementwiseToLinalgPass());
-  // Needed to lower affine.map and affine.apply
-  manager.addNestedPass<FuncOp>(affine::createAffineExpandIndexOpsPass());
-  manager.addNestedPass<FuncOp>(affine::createSimplifyAffineStructuresPass());
-  manager.addPass(createLowerAffinePass());
-  manager.addNestedPass<FuncOp>(memref::createExpandOpsPass());
-  manager.addNestedPass<FuncOp>(memref::createExpandStridedMetadataPass());
-
   // Bufferize
+  prepareForBufferize(manager);
   oneShotBufferize(manager);
 
   // Linalg must be bufferized before it can be lowered
@@ -113,16 +122,8 @@ void polynomialToLLVMPipelineBuilder(OpPassManager& manager) {
 }
 
 void basicMLIRToLLVMPipelineBuilder(OpPassManager& manager) {
-  // Linalg
-  manager.addNestedPass<FuncOp>(createConvertElementwiseToLinalgPass());
-  // Needed to lower affine.map and affine.apply
-  manager.addNestedPass<FuncOp>(affine::createAffineExpandIndexOpsPass());
-  manager.addNestedPass<FuncOp>(affine::createSimplifyAffineStructuresPass());
-  manager.addPass(createLowerAffinePass());
-  manager.addNestedPass<FuncOp>(memref::createExpandOpsPass());
-  manager.addNestedPass<FuncOp>(memref::createExpandStridedMetadataPass());
-
   // Bufferize
+  prepareForBufferize(manager);
   oneShotBufferize(manager);
 
   // Linalg must be bufferized before it can be lowered

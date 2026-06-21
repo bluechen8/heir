@@ -42,6 +42,22 @@ void lweToLinalgPipelineBuilder(OpPassManager& manager) {
 
 void toIreeLinalgPipelineBuilder(OpPassManager& pm,
                                  const MlirToRLWEPipelineOptions& options) {
+  // Disable --split-preprocessing for the linalg arm. Upstream flipped its
+  // default from 0 (no split) to 16, which hoists the plaintext packing +
+  // `lwe.rlwe_encode` into a separate `forward__preprocessing` function and
+  // feeds the encoded plaintext into `forward__preprocessed` as a function
+  // argument. Our A1 model folds plaintext encoding at compile time
+  // (--fold-plaintext-encoding) and the radd_plain/rsub_plain LWEToLinalg
+  // patterns read the `lwe.encoded_limbs` attr off the encode op that
+  // *locally* produces their plaintext operand — they cannot cross the
+  // call/argument boundary the split introduces, and the `lwe` dialect has
+  // no inliner interface to collapse it back. Forcing 0 keeps `forward`
+  // self-contained, matching what the patterns expect. (The split is a
+  // host-runtime optimization that doesn't fit the compile-time-fold path.)
+  // const_cast: `options` is this pipeline's own options object, mutated
+  // before the front-half pass manager reads it.
+  const_cast<MlirToRLWEPipelineOptions&>(options).splitPreprocessing = 0;
+
   // Front-half is shared verbatim with the OpenFHE / Lattigo pipelines:
   // it produces secret-annotated CKKS IR with client encrypt/decrypt
   // helpers tagged in place.

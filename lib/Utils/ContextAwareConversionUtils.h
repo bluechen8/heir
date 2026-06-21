@@ -169,11 +169,17 @@ class SecretGenericOpConversion
                                                 op.getResults(), resultTypes)))
       return failure();
 
-    // only preserve dialect attrs
-    // we do not want op attrs like overflowFlags from arith.add
+    // Preserve dialect attributes and inherent attributes of the target op Y.
+    // We still do not want unrelated op attributes like overflowFlags from
+    // arith.add unless they are also inherent attributes of Y.
     SmallVector<NamedAttribute> attrsToPreserve;
     for (auto& namedAttr : innerOp.getDialectAttrs()) {
       attrsToPreserve.push_back(namedAttr);
+    }
+    for (auto attrName : Y::getAttributeNames()) {
+      if (auto attr = innerOp.getAttr(attrName)) {
+        attrsToPreserve.push_back(rewriter.getNamedAttr(attrName, attr));
+      }
     }
 
     // Must preserve mgmt attrs from the enclosing generic so that later ops
@@ -181,8 +187,15 @@ class SecretGenericOpConversion
     // OperandAndResultAttrInterface, and this gives special names to the
     // attributes, so it doesn't make sense to copy those names to the
     // converted op.
-    convertArrayOfDicts(op.getAllOperandAttrsAttr(), attrsToPreserve);
+    //
+    // Note that these attributes are deduped, so for example, if there is a
+    // mgmt.mgmt attribute on the operands and results of a generic, only the
+    // result mgmt.mgmt attribute will be copied to be the mgmt.mgmt attribute
+    // associated with the new op result. This is what we want, but if the order
+    // of these calls were swapped, the _operand_ mgmt attrs would become
+    // associated with the new _result_ SSA value, which is incorrect.
     convertArrayOfDicts(op.getAllResultAttrsAttr(), attrsToPreserve);
+    convertArrayOfDicts(op.getAllOperandAttrsAttr(), attrsToPreserve);
     DenseSet<StringRef> seenNames;
     SmallVector<NamedAttribute> dedupedAttrsToPreserve;
     for (NamedAttribute preservedAttr : attrsToPreserve) {

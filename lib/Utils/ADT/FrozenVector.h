@@ -49,16 +49,6 @@ namespace llvm {
 // DenseMapInfo specialization to enable use as DenseMap key
 template <typename T, unsigned N>
 struct DenseMapInfo<::mlir::heir::FrozenVector<T, N>> {
-  static ::mlir::heir::FrozenVector<T, N> getEmptyKey() {
-    return ::mlir::heir::FrozenVector<T, N>();
-  }
-
-  static ::mlir::heir::FrozenVector<T, N> getTombstoneKey() {
-    llvm::SmallVector<T, N> tombstone;
-    tombstone.push_back(DenseMapInfo<T>::getTombstoneKey());
-    return ::mlir::heir::FrozenVector<T, N>(std::move(tombstone));
-  }
-
   static unsigned getHashValue(const ::mlir::heir::FrozenVector<T, N>& val) {
     return hash_combine_range(val.begin(), val.end());
   }
