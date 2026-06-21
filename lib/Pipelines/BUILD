@@ -101,6 +101,7 @@ cc_library(
         ":ArithmeticPipelineRegistration",
         "@heir//lib/Dialect/CKKS/Transforms:CKKSToLWE",
         "@heir//lib/Dialect/LWE/Conversions/LWEToLinalg",
+        "@heir//lib/Transforms/CheckNoRingDimBump",
         "@heir//lib/Transforms/FoldPlaintextEncoding",
         "@heir//lib/Transforms/IsolateServerModule",
         "@heir//lib/Transforms/SplitClientInterface",

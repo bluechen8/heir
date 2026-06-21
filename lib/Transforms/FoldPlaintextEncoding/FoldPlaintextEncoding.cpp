@@ -2,14 +2,36 @@
 // each `lwe.rlwe_encode` on a constant operand and stamp it as the
 // discardable `lwe.encoded_limbs` attribute.
 //
-// The encoder is the textbook CKKS InverseCanonicalEmbedding: real
-// inputs become N/2 complex slots (imag = 0), extended
-// conjugate-symmetrically to ℂ^N, then inverted by direct DFT at the
-// odd-power 2N-th roots of unity:
-//   p[j] = (1/N) Σ_k zFull[k] · exp(-iπ(2k+1)j/N).
-// Coefficients are scaled by Δ = 2^logDefaultScale, rounded, and
-// reduced into [0, q_i) per RNS limb. Semantics match Lattigo's
-// `Encoder.Encode` and OpenFHE's `MakeCKKSPackedPlaintext`.
+// Pipeline (matching Lattigo `Encoder.Encode` ∘ `Encrypt`):
+//   1. CKKS InverseCanonicalEmbedding: real inputs become N/2 complex
+//      CKKS slots (imag = 0). We run Lattigo's `SpecialIFFTDouble`
+//      (rotGroup-indexed butterfly + bit-reverse) on the slot buffer,
+//      then split iFFT outputs into the polynomial as
+//        coeffs[i]         = real(iFFT[i])
+//        coeffs[i + halfN] = imag(iFFT[i])  for i ∈ [0, N/2).
+//      Indexing twiddles by `rotGroup[j] = 5^j mod 2N` bakes in the
+//      CKKS slot-to-evaluation-point permutation; the same convention
+//      is used by every mainstream CKKS library (Lattigo, OpenFHE,
+//      SEAL, CROSS), so this is what lets HEIR-encoded plaintexts
+//      pair element-wise with Lattigo-encrypted ciphertexts.
+//   2. Coefficients are scaled by Δ = 2^logDefaultScale, rounded, and
+//      reduced into [0, q_j) per RNS limb.
+//   3. Per-limb negacyclic NTT (eval at ψ, ψ^3, …, ψ^{2N-1} mod q_j
+//      where ψ is a primitive 2N-th root of unity). Output is in
+//      bit-reversed natural order to match Lattigo's
+//      `ring.NTTStandard` layout (`ring.Poly.Coeffs[lvl]`).
+//
+// The resulting `lwe.encoded_limbs` tensor lives in **evaluation
+// form**, matching the convention used by Lattigo `*rlwe.Ciphertext`
+// values throughout the runtime. Downstream linalg patterns add/sub
+// element-wise without any further NTT until multiplication lands
+// (Phase 3).
+//
+// Splat inputs (e.g. nn.Parameter(zeros) biases) skip both the iFFT
+// and the NTT — the post-NTT result is a constant tensor whose value
+// is `c · Δ mod q_j` tiled across the degree axis, so we write it
+// directly. Necessary at production N=8192 where O(N²) trig + O(N²)
+// DFT per encode would otherwise dominate heir-opt wall time.
 //
 // No-op when the module has no `ckks.schemeParam`, or when no encode
 // op's input traces back to a compile-time constant (see
@@ -22,6 +44,8 @@
 #include <cstdint>
 #include <utility>
 
+#include "lib/Transforms/FoldPlaintextEncoding/Ntt.h"
+
 #include "lib/Dialect/CKKS/IR/CKKSAttributes.h"
 #include "lib/Dialect/CKKS/IR/CKKSDialect.h"
 #include "lib/Dialect/LWE/IR/LWEAttributes.h"
@@ -33,6 +57,7 @@
 #include "lib/Dialect/ModArith/IR/ModArithTypes.h"
 #include "lib/Dialect/ModuleAttributes.h"
 #include "llvm/include/llvm/ADT/SmallVector.h"          // from @llvm-project
+#include "llvm/include/llvm/Support/MathExtras.h"       // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"   // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
@@ -252,68 +277,119 @@ APInt scaleRoundReduce(double slot, int64_t logScale, uint64_t modulus,
   return APInt(bitwidth, static_cast<uint64_t>(r), /*isSigned=*/false);
 }
 
-// Invert the CKKS canonical embedding τ_N. Real-valued inputs are
-// interpreted as the real parts of N/2 complex slots (imag = 0),
-// padded or truncated to N/2 slots, then extended conjugate-
-// symmetrically to ℂ^N before applying
-//   p[j] = (1/N) Σ_k zFull[k] · exp(-iπ(2k+1)j/N).
+// Invert the CKKS canonical embedding τ_N, matching Lattigo's
+// `ckks.SpecialIFFTDouble` (rotGroup-indexed butterfly). Real-valued
+// inputs are interpreted as the real parts of N/2 complex CKKS slots
+// (imag = 0). The slot-to-evaluation-point map uses the 5-power
+// permutation `rotGroup[i] = 5^i mod 2N` so a 1-slot rotation becomes
+// the single automorphism σ₅: X ↦ X⁵. Every mainstream CKKS library
+// (Lattigo / OpenFHE / SEAL / CROSS) uses this layout; matching it
+// here is what lets HEIR-encoded plaintexts pair element-wise with
+// Lattigo-encrypted ciphertexts.
 //
-// All angles are multiples of π/N, so we precompute the 2N roots of
-// unity once and look them up by `((2k+1)·j) mod 2N`. That collapses
-// per-encode-op trig calls from O(N²) to O(N) and replaces the inner
-// loop's trig with a table lookup — necessary at production N=8192
-// where naive O(N²) trig would dominate `heir-opt` wall time.
+// Pipeline (port of `schemes/ckks/ckks_vector_ops.go:SpecialIFFTDouble`
+// in Lattigo v6.1.0):
+//   1. Copy slot values into a complex buffer of length halfN = N/2.
+//   2. In-place inverse butterfly with twiddles
+//        roots[(lenq − (rotGroup[j] & mask)) << logGap]
+//      where roots[m] = exp(2πi·m / M) and M = 2N. Indexing the
+//      twiddle by rotGroup baked the slot permutation into the iFFT.
+//   3. Divide by halfN.
+//   4. Bit-reverse in place.
+//   5. Map back to polynomial coefficients:
+//        coeffs[i]         = real(buf[i])
+//        coeffs[i + halfN] = imag(buf[i])
+//      (Lattigo `Complex128ToFixedPointCRT`, ring.Standard branch.)
 //
 // A constant slot vector z = (c, c, …, c) maps to the constant
-// polynomial p(x) = c (i.e. p[0] = c, p[j>0] = 0), so we short-
-// circuit splat input directly.
+// polynomial p(x) = c (i.e. p[0] = c, p[j>0] = 0) under any of these
+// conventions (after iFFT + bit-reverse, only buf[0] is non-zero and
+// purely real), so we short-circuit splat input directly.
 void inverseCanonicalEmbedding(ArrayRef<double> slots, int N,
                                SmallVectorImpl<double>& coeffs) {
   using Complex = std::complex<double>;
   assert(N > 0 && (N % 2 == 0) && "ring degree must be a positive even");
   const int halfN = N / 2;
+  const int M = 2 * N;
   coeffs.assign(N, 0.0);
 
-  const int copy = std::min(halfN, static_cast<int>(slots.size()));
-  if (copy == 0) return;
+  const int numCopy = std::min(halfN, static_cast<int>(slots.size()));
+  if (numCopy == 0) return;
 
   bool isSplat = true;
-  for (int k = 1; k < copy; ++k) {
+  for (int k = 1; k < numCopy; ++k) {
     if (slots[k] != slots[0]) { isSplat = false; break; }
   }
   // Trailing pads of zero break the splat invariant unless the splat
   // value is itself zero.
-  if (copy < halfN && slots[0] != 0.0) isSplat = false;
+  if (numCopy < halfN && slots[0] != 0.0) isSplat = false;
   if (isSplat) {
     coeffs[0] = slots[0];
     return;
   }
 
-  SmallVector<Complex, 32> zFull(N, Complex(0.0, 0.0));
-  for (int k = 0; k < copy; ++k) {
-    Complex z(slots[k], 0.0);
-    zFull[k] = z;
-    zFull[N - 1 - k] = std::conj(z);
+  // Slot buffer (length halfN). Unused tail is left at zero.
+  SmallVector<Complex, 32> buf(halfN, Complex(0.0, 0.0));
+  for (int k = 0; k < numCopy; ++k) buf[k] = Complex(slots[k], 0.0);
+
+  // rotGroup[i] = 5^i mod M, for i in [0, halfN).
+  SmallVector<int, 32> rotGroup(halfN);
+  int fivePows = 1;
+  for (int i = 0; i < halfN; ++i) {
+    rotGroup[i] = fivePows;
+    fivePows = (fivePows * 5) & (M - 1);
   }
 
-  // roots[m] = exp(-iπ·m / N) for m ∈ [0, 2N). exp(-iπ(2k+1)j/N) is
-  // then roots[((2k+1)·j) mod (2N)].
-  const int twoN = 2 * N;
-  SmallVector<Complex, 64> roots(twoN);
-  const double piOverN = M_PI / static_cast<double>(N);
-  for (int m = 0; m < twoN; ++m) {
-    double angle = -piOverN * m;
+  // roots[m] = exp(2πi · m / M) for m ∈ [0, M]. The butterfly indexes
+  // up to (lenq − 1) << logGap = M − (1<<logGap) < M, so size M
+  // suffices, but we allocate M+1 to mirror Lattigo's convention.
+  SmallVector<Complex, 64> roots(M + 1);
+  const double twoPiOverM = 2.0 * M_PI / static_cast<double>(M);
+  for (int m = 0; m <= M; ++m) {
+    double angle = twoPiOverM * static_cast<double>(m);
     roots[m] = Complex(std::cos(angle), std::sin(angle));
   }
 
-  for (int j = 0; j < N; ++j) {
-    Complex sum(0.0, 0.0);
-    for (int k = 0; k < N; ++k) {
-      int idx = ((2 * k + 1) * j) % twoN;
-      if (idx < 0) idx += twoN;
-      sum += zFull[k] * roots[idx];
+  // logN = log2(halfN), logM = log2(M). Both halfN and M are powers
+  // of 2 by construction (N positive and even, M = 2N).
+  const int logN = llvm::Log2_64(static_cast<uint64_t>(halfN));
+  const int logM = llvm::Log2_64(static_cast<uint64_t>(M));
+
+  // Lattigo `SpecialIFFTDouble` butterfly.
+  for (int loglen = logN; loglen > 0; --loglen) {
+    int len = 1 << loglen;
+    int lenh = len >> 1;
+    int lenq = len << 2;
+    int logGap = logM - 2 - loglen;
+    int mask = lenq - 1;
+    for (int i = 0; i < halfN; i += len) {
+      for (int j = 0, k = i; j < lenh; ++j, ++k) {
+        Complex u = buf[k] + buf[k + lenh];
+        int idx = (lenq - (rotGroup[j] & mask)) << logGap;
+        Complex v = (buf[k] - buf[k + lenh]) * roots[idx];
+        buf[k] = u;
+        buf[k + lenh] = v;
+      }
     }
-    coeffs[j] = sum.real() / static_cast<double>(N);
+  }
+  for (int i = 0; i < halfN; ++i)
+    buf[i] /= static_cast<double>(halfN);
+
+  // Bit-reverse the slot buffer in place.
+  auto bitReverseSmall = [](int x, int bits) {
+    int r = 0;
+    for (int b = 0; b < bits; ++b) { r = (r << 1) | (x & 1); x >>= 1; }
+    return r;
+  };
+  for (int i = 0; i < halfN; ++i) {
+    int j = bitReverseSmall(i, logN);
+    if (j > i) std::swap(buf[i], buf[j]);
+  }
+
+  // Map iFFT output → real polynomial coefficients of degree N-1.
+  for (int i = 0; i < halfN; ++i) {
+    coeffs[i] = buf[i].real();
+    coeffs[i + halfN] = buf[i].imag();
   }
 }
 
@@ -382,25 +458,109 @@ FailureOr<ElementsAttr> encodeOnePlaintext(
   unsigned bitwidth = 64;
   auto storageType = IntegerType::get(ctx, bitwidth);
 
-  // Read input slot vector and apply the inverse canonical embedding
-  // to recover N real polynomial coefficients.
+  // Read input slot vector.
   SmallVector<double> slots;
   if (failed(readSlotValues(cleartext, slots)))
     return op.emitOpError() << "unsupported cleartext element type";
-  SmallVector<double, 32> realCoeffs;
-  inverseCanonicalEmbedding(slots, static_cast<int>(degree), realCoeffs);
 
   int64_t numLimbs = static_cast<int64_t>(qiArr.size());
+  uint64_t twoN = static_cast<uint64_t>(2 * degree);
+
+  // NTT-friendly check on every limb prime. Lattigo and OpenFHE param
+  // generation always produce friendly primes, so a failure here means
+  // scheme params were hand-tuned incorrectly.
+  for (int64_t j = 0; j < numLimbs; ++j) {
+    uint64_t modulus = static_cast<uint64_t>(qiArr[j]);
+    if (modulus < 2 || (modulus - 1) % twoN != 0) {
+      return op.emitOpError()
+             << "modulus q_" << j << " = " << modulus
+             << " does not satisfy q ≡ 1 (mod 2N=" << twoN
+             << "); regenerate scheme params";
+    }
+  }
+
+  // Detect splat input. The canonical embedding of a constant slot
+  // vector z = (c, c, …, c) is the constant polynomial p(x) = c; the
+  // negacyclic NTT then maps that to the constant evaluation tensor
+  // (c, c, …, c) at every position. We skip both the O(N²) iFFT and
+  // the O(N²) NTT in this case — important at production N=8192
+  // where each constant nn.Parameter bias would otherwise dominate
+  // heir-opt wall time.
+  bool isSplat = !slots.empty();
+  double splatVal = slots.empty() ? 0.0 : slots[0];
+  for (double s : slots) {
+    if (s != splatVal) { isSplat = false; break; }
+  }
+  // Slot vectors shorter than N/2 are implicitly zero-padded by the
+  // canonical embedding; a non-zero splat with padding isn't a true
+  // splat in the polynomial.
+  int64_t halfN = degree / 2;
+  if (isSplat && static_cast<int64_t>(slots.size()) < halfN &&
+      splatVal != 0.0)
+    isSplat = false;
 
   SmallVector<APInt> limbs;
   limbs.reserve(degree * numLimbs);
-  for (int64_t i = 0; i < degree; ++i) {
+
+  if (isSplat) {
+    // Per-limb residue c · Δ mod q_j, tiled across the degree axis.
+    SmallVector<APInt, 8> perLimb;
+    perLimb.reserve(numLimbs);
     for (int64_t j = 0; j < numLimbs; ++j) {
       uint64_t modulus = static_cast<uint64_t>(qiArr[j]);
-      limbs.emplace_back(
-          scaleRoundReduce(realCoeffs[i], logScale, modulus, bitwidth));
+      perLimb.push_back(
+          scaleRoundReduce(splatVal, logScale, modulus, bitwidth));
+    }
+    for (int64_t i = 0; i < degree; ++i)
+      for (int64_t j = 0; j < numLimbs; ++j) limbs.push_back(perLimb[j]);
+  } else {
+    // General path: ifft → coeff-form residues → per-limb negacyclic NTT.
+    SmallVector<double, 32> realCoeffs;
+    inverseCanonicalEmbedding(slots, static_cast<int>(degree), realCoeffs);
+
+    // Storage layout in `limbs` is degree-major: limbs[i*numLimbs + j].
+    limbs.assign(degree * numLimbs,
+                 APInt(bitwidth, 0, /*isSigned=*/false));
+    SmallVector<uint64_t> column(degree);
+    SmallVector<uint64_t> evals(degree);
+    SmallVector<uint64_t> psiPowers(twoN);
+    for (int64_t j = 0; j < numLimbs; ++j) {
+      uint64_t modulus = static_cast<uint64_t>(qiArr[j]);
+      auto bredConst =
+          fold_plaintext_encoding::computeBRed(modulus);
+      uint64_t psi =
+          fold_plaintext_encoding::findPrimitive2NthRoot(modulus, degree);
+      if (psi == 0) {
+        return op.emitOpError()
+               << "could not derive a primitive 2N-th root of unity for q_"
+               << j << " = " << modulus << " (N=" << degree << ")";
+      }
+      // psiPowers[m] = ψ^m mod q for m ∈ [0, 2N).
+      psiPowers[0] = 1 % modulus;
+      for (uint64_t m = 1; m < twoN; ++m) {
+        psiPowers[m] = fold_plaintext_encoding::mulmod(
+            psiPowers[m - 1], psi, modulus, bredConst);
+      }
+
+      // Gather column j (the per-degree coefficient-form residues for
+      // this limb), NTT in place, scatter back into row-major limbs.
+      for (int64_t i = 0; i < degree; ++i) {
+        APInt v = scaleRoundReduce(realCoeffs[i], logScale, modulus,
+                                   bitwidth);
+        column[i] = v.getZExtValue();
+      }
+      fold_plaintext_encoding::nttPerLimb(
+          /*coeffs=*/llvm::ArrayRef<uint64_t>(column),
+          /*N=*/degree, /*q=*/modulus, /*bredConst=*/bredConst,
+          /*psiPowers=*/llvm::ArrayRef<uint64_t>(psiPowers),
+          /*evals=*/evals);
+      for (int64_t i = 0; i < degree; ++i) {
+        limbs[i * numLimbs + j] =
+            APInt(bitwidth, evals[i], /*isSigned=*/false);
+      }
     }
   }
+
   auto tensorTy = RankedTensorType::get({degree, numLimbs}, storageType);
   return buildLimbsAttr(tensorTy, limbs, uniqueId);
 }

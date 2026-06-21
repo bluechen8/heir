@@ -8,8 +8,14 @@ package(
 
 cc_library(
     name = "FoldPlaintextEncoding",
-    srcs = ["FoldPlaintextEncoding.cpp"],
-    hdrs = ["FoldPlaintextEncoding.h"],
+    srcs = [
+        "FoldPlaintextEncoding.cpp",
+        "Ntt.cpp",
+    ],
+    hdrs = [
+        "FoldPlaintextEncoding.h",
+        "Ntt.h",
+    ],
     deps = [
         ":pass_inc_gen",
         "@heir//lib/Dialect:ModuleAttributes",

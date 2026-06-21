@@ -19,9 +19,11 @@
 
 // CHECK-LABEL: func.func @radd_plain
 // CHECK-SAME:    %[[CT:.*]]: tensor<2x4x1xi64>
-// Constant plaintext = (1.0, 1.0, 1.0, 1.0) through CKKS iFFT with
-// Δ = 16 reduces to the constant polynomial: p[0]=16, p[1..3]=0.
-// CHECK-DAG:     %[[PT:.*]] = arith.constant dense<{{\[}}[16], [0], [0], [0]]> : tensor<4x1xi64>
+// Splat slot vector (1.0, 1.0, 1.0, 1.0) → constant polynomial p(X)=1,
+// whose negacyclic NTT yields the splat evaluation tensor
+// (1, 1, 1, 1). With Δ = 16 the per-(i,j) limb residue is 16, tiled
+// across the degree axis — collapses to `dense<16>`.
+// CHECK-DAG:     %[[PT:.*]] = arith.constant dense<16> : tensor<4x1xi64>
 // CHECK-DAG:     %[[Q:.*]] = arith.constant dense<97> : tensor<1xi64>
 // CHECK:         %[[CT0:.*]] = tensor.extract_slice %[[CT]][0, 0, 0] [1, 4, 1] [1, 1, 1]
 // CHECK:         %[[SUM:.*]] = linalg.generic

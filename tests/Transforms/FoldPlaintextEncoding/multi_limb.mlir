@@ -1,16 +1,18 @@
 // RUN: heir-opt --fold-plaintext-encoding %s | FileCheck %s
 
-// Two-limb RNS, non-zero cleartext exercises the iFFT path. For ring
-// degree N=4 the canonical embedding has N/2 = 2 slots; we feed the
-// first 2 values (slots z = (1+0i, 1+0i)). The polynomial whose
-// canonical embedding is the constant vector (c, c, …) is the constant
-// polynomial p(x) = c, so:
-//   p = (1, 0, 0, 0)
-//   scaled = (16, 0, 0, 0)        with Δ = 2^4 = 16
-//   limbs  = ((16,16), (0,0), (0,0), (0,0))  per (q0=97, q1=193)
+// Two-limb RNS, splat (constant) cleartext exercises the splat fast
+// path. For ring degree N=4 the canonical embedding has N/2 = 2 slots;
+// we feed slots z = (1+0i, 1+0i). The polynomial whose canonical
+// embedding is the constant slot vector is the constant polynomial
+// p(x) = c, and the negacyclic NTT of a constant polynomial is the
+// constant tensor (c, c, c, c) at every evaluation point.
 //
-// Both limbs see the same value because 16 < 97 < 193 (no wrap on
-// either modulus).
+// So after scale-round-reduce we get per-limb residue
+//   c · Δ mod q_j = 1 · 16 mod q_j = 16  (both limbs, since 16 < 97 < 193).
+// Tiled across the degree axis the result is dense<16> : tensor<4x2xi64>.
+//
+// `--fold-plaintext-encoding` detects the splat slot vector and skips
+// both the O(N²) iFFT and the O(N²) NTT for this case.
 
 !Zq0 = !mod_arith.int<97 : i64>
 !Zq1 = !mod_arith.int<193 : i64>
@@ -22,7 +24,7 @@
 
 // CHECK-LABEL: func.func @encode_ones
 // CHECK:         lwe.rlwe_encode
-// CHECK-SAME:    lwe.encoded_limbs = dense<{{\[}}[16, 16], [0, 0], [0, 0], [0, 0]]> : tensor<4x2xi64>
+// CHECK-SAME:    lwe.encoded_limbs = dense<16> : tensor<4x2xi64>
 module attributes {ckks.schemeParam = #ckks.scheme_param<logN = 2, Q = [97, 193], P = [257], logDefaultScale = 4>} {
   func.func @encode_ones() -> !pt {
     %cst = arith.constant dense<1.000000e+00> : tensor<4xf64>

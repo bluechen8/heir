@@ -258,14 +258,20 @@ struct SecretToCKKS : public impl::SecretToCKKSBase<SecretToCKKS> {
       return;
     }
 
-    // NOTE: 2 ** logN != polyModDegree
-    // they have different semantic
-    // auto logN = schemeParamAttr.getLogN();
-
-    // pass option polyModDegree is actually the number of slots
-    // TODO(#1402): use a proper name for CKKS
+    // CipherPlan-HEIR fork: size the rlwe ring from
+    // `schemeParamAttr.logN` (= actual ring degree N decided by
+    // --generate-param-ckks), NOT from `polyModDegree` (= slot count
+    // N/2 = misnamed pass option, see upstream issues #1402 / #2764).
+    //
+    // Without this, every LWE-typed value in the linalg arm carries a
+    // ring `<1 + x^(N/2)>` while the Lattigo arm encrypts in
+    // `<1 + x^N>` — half the ring. The Lattigo↔IREE bridge in
+    // CipherPlan-HEIR Phase 2.2.3 needs both arms to agree on the
+    // limb-tensor shape, so we use the actual N here. See
+    // `research-plan/heir-upstream-patches.md` entry #1.
+    int64_t ringN = int64_t{1} << schemeParamAttr.getLogN();
     auto rlweRing = getRlweRNSRing(context, schemeParamAttr.getQ().asArrayRef(),
-                                   polyModDegree);
+                                   ringN);
     if (failed(rlweRing)) {
       return signalPassFailure();
     }

@@ -125,6 +125,7 @@ cc_binary(
         "@heir//lib/Transforms/ActivationCanonicalizations",
         "@heir//lib/Transforms/AddClientInterface",
         "@heir//lib/Transforms/SplitClientInterface",
+        "@heir//lib/Transforms/CheckNoRingDimBump",
         "@heir//lib/Transforms/IsolateServerModule",
         "@heir//lib/Transforms/AnnotateModule",
         "@heir//lib/Transforms/AnnotateMulDepth",

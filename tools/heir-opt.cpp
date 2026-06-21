@@ -71,6 +71,7 @@
 #include "lib/Transforms/ActivationCanonicalizations/ActivationCanonicalizations.h"
 #include "lib/Transforms/AddClientInterface/AddClientInterface.h"
 #include "lib/Transforms/SplitClientInterface/SplitClientInterface.h"
+#include "lib/Transforms/CheckNoRingDimBump/CheckNoRingDimBump.h"
 #include "lib/Transforms/IsolateServerModule/IsolateServerModule.h"
 #include "lib/Transforms/AnnotateModule/AnnotateModule.h"
 #include "lib/Transforms/AnnotateMulDepth/AnnotateMulDepth.h"
@@ -312,6 +313,7 @@ int main(int argc, char** argv) {
   registerAddClientInterfacePass();
   registerSplitClientInterfacePass();
   registerIsolateServerModulePass();
+  registerCheckNoRingDimBumpPass();
   registerElementwiseToAffinePasses();
   registerSecretizePasses();
   registerSecretInsertMgmtPasses();

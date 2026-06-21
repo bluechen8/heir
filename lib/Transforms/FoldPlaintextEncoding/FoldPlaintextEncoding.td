@@ -9,14 +9,28 @@ def FoldPlaintextEncoding : Pass<"fold-plaintext-encoding", "mlir::ModuleOp"> {
     Runs after `--ckks-to-lwe`, before `--lwe-to-linalg`. For each
     `lwe.rlwe_encode` whose input traces back to an `arith.constant`
     (inline or `dense_resource<KEY>`), evaluates the CKKS
-    InverseCanonicalEmbedding encoder in C++ — iFFT, scale by
-    Δ = 2^logDefaultScale, round, reduce mod q_i per RNS limb — and
-    stamps the result on the op as a discardable `lwe.encoded_limbs`
-    attribute of type `tensor<degree x num_limbs x iK>`. The op's SSA
-    shape is unchanged; downstream `--lwe-to-linalg` patterns for
+    InverseCanonicalEmbedding encoder in C++ — Lattigo-compatible
+    `SpecialIFFTDouble` (5-power `rotGroup` slot-permutation
+    butterfly), scale by Δ = 2^logDefaultScale, round, reduce mod
+    q_i per RNS limb, then per-limb negacyclic NTT to evaluation
+    form — and stamps the result on the op as a discardable
+    `lwe.encoded_limbs` attribute of type
+    `tensor<degree x num_limbs x iK>`. The op's SSA shape is
+    unchanged; downstream `--lwe-to-linalg` patterns for
     `lwe.radd_plain` / `lwe.rsub_plain` read the attribute and
-    materialize an `arith.constant` to add/sub against the ciphertext
-    limbs.
+    materialize an `arith.constant` to add/sub against the
+    ciphertext limbs.
+
+    The encoded plaintexts pair element-wise with Lattigo-encrypted
+    ciphertexts (matching `*rlwe.Ciphertext.Value[i].Coeffs[lvl]`).
+    OpenFHE / SEAL / CROSS use the same slot-to-evaluation-point
+    layout.
+
+    **Requires NTT-friendly limb primes**: every `q_i ∈ Q` must
+    satisfy `q_i ≡ 1 (mod 2N)`, where `N = 1 << logN` is the ring
+    degree. Lattigo and OpenFHE default parameter generation produce
+    such primes; the pass hard-fails with a diagnostic that points
+    at `ckks.schemeParam` if a hand-tuned override slips through.
 
     Scheme parameters (logN, Q, logDefaultScale) are read from the
     module-level `ckks.schemeParam` attribute set by

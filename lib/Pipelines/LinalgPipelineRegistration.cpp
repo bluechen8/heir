@@ -19,6 +19,7 @@
 #include "lib/Dialect/CKKS/Transforms/CKKSToLWE.h"
 #include "lib/Dialect/LWE/Conversions/LWEToLinalg/LWEToLinalg.h"
 #include "lib/Pipelines/ArithmeticPipelineRegistration.h"
+#include "lib/Transforms/CheckNoRingDimBump/CheckNoRingDimBump.h"
 #include "lib/Transforms/FoldPlaintextEncoding/FoldPlaintextEncoding.h"
 #include "lib/Transforms/IsolateServerModule/IsolateServerModule.h"
 #include "lib/Transforms/SplitClientInterface/SplitClientInterface.h"
@@ -45,6 +46,13 @@ void toIreeLinalgPipelineBuilder(OpPassManager& pm,
   // it produces secret-annotated CKKS IR with client encrypt/decrypt
   // helpers tagged in place.
   mlirToRLWEPipeline(pm, options, RLWEScheme::ckksScheme);
+
+  // Fail loudly if --generate-param-ckks bumped the slot count above
+  // the user-supplied --ciphertext-degree. Rotom emits packing /
+  // rotation IR against the original slot count; a bumped CKKS scheme
+  // would silently decrypt to wrong values. The diagnostic surfaces
+  // the next-higher --ciphertext-degree the caller should try.
+  pm.addPass(createCheckNoRingDimBump());
 
   // Drop CKKS ops to LWE — same fork point Lattigo / OpenFHE use.
   pm.addPass(ckks::createCKKSToLWE());
